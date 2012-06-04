@@ -2118,7 +2118,6 @@ elif $cc -V 2>&1 | grep -q Sun; then
                     ;;
                 -std=c99)             echo -xc99              ;;
                 -fomit-frame-pointer) echo -xregs=frameptr    ;;
-                -fPIC)                echo -KPIC -xcode=pic32 ;;
                 -W*,*)                echo $flag              ;;
                 -f*-*|-W*)                                    ;;
                 *)                    echo $flag              ;;
@@ -2657,10 +2656,7 @@ enabled version3 && { enabled gpl && enable gplv3 || enable lgplv3; }
 disabled optimizations || check_cflags -fomit-frame-pointer
 
 enable_pic() {
-    enable pic
-    add_cppflags -DPIC
-    add_cflags   -fPIC
-    add_asflags  -fPIC
+    enabled pic
 }
 
 enabled pic && enable_pic

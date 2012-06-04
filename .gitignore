@@ -8,10 +8,12 @@
 *.exe
 *.ho
 *.lib
+*.opus
 *.pc
 *.so
 *.so.*
 *.ver
+*.wav
 *-example
 *-test
 config.*

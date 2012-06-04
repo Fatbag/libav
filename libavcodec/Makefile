@@ -298,6 +298,7 @@ OBJS-$(CONFIG_NELLYMOSER_DECODER)      += nellymoserdec.o nellymoser.o
 OBJS-$(CONFIG_NELLYMOSER_ENCODER)      += nellymoserenc.o nellymoser.o \
                                           audio_frame_queue.o
 OBJS-$(CONFIG_NUV_DECODER)             += nuv.o rtjpeg.o
+OBJS-$(CONFIG_OPUS_DECODER)            += opus.o
 OBJS-$(CONFIG_PAM_DECODER)             += pnmdec.o pnm.o
 OBJS-$(CONFIG_PAM_ENCODER)             += pamenc.o pnm.o
 OBJS-$(CONFIG_PBM_DECODER)             += pnmdec.o pnm.o
@@ -621,6 +622,7 @@ OBJS-$(CONFIG_LIBXVID_ENCODER)            += libxvid.o
 # parsers
 OBJS-$(CONFIG_AAC_PARSER)              += aac_parser.o aac_ac3_parser.o \
                                           aacadtsdec.o mpeg4audio.o
+OBJS-$(CONFIG_AAC_LATM_PARSER)         += latm_parser.o
 OBJS-$(CONFIG_AC3_PARSER)              += ac3_parser.o ac3tab.o \
                                           aac_ac3_parser.o
 OBJS-$(CONFIG_ADX_PARSER)              += adx_parser.o adx.o
@@ -641,7 +643,6 @@ OBJS-$(CONFIG_H264_PARSER)             += h264_parser.o h264.o            \
                                           h264_loopfilter.o h264_cabac.o \
                                           h264_cavlc.o h264_ps.o \
                                           mpegvideo.o error_resilience.o
-OBJS-$(CONFIG_AAC_LATM_PARSER)         += latm_parser.o
 OBJS-$(CONFIG_MJPEG_PARSER)            += mjpeg_parser.o
 OBJS-$(CONFIG_MLP_PARSER)              += mlp_parser.o mlp.o
 OBJS-$(CONFIG_MPEG4VIDEO_PARSER)       += mpeg4video_parser.o h263.o \

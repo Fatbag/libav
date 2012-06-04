@@ -1,0 +1,4 @@
+./configure --disable-doc --disable-avplay --disable-avprobe --disable-avserver --disable-avdevice --disable-encoders --enable-encoder=pcm_s16le --disable-decoders --enable-decoder=opus --disable-hwaccels --disable-muxers --enable-muxer=wav --disable-demuxers --enable-demuxer=ogg --disable-parsers --enable-parser=vorbis --disable-bsfs --disable-protocols --enable-protocol=file --disable-indevs --disable-outdevs --disable-devices --enable-extra-warnings --extra-cflags="-DDEBUG -fomit-frame-pointer" --extra-ldflags="-s" --enable-debug=3 --disable-optimizations
+
+Debugging messages:
+avconv -loglevel debug -i infile outfile

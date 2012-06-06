@@ -21,6 +21,7 @@
 
 #include "libavutil/audioconvert.h"
 #include "libavutil/intreadwrite.h"
+#include "libavcodec/opus.h"
 #include "avformat.h"
 #include "internal.h"
 #include "oggdec.h"
@@ -28,6 +29,9 @@
 struct opus_params {
     int header_count;
     int pre_skip;
+    int last_granule;
+    int page_duration;
+    int page;
 };
 
 static const uint64_t opus_channel_layouts[9] = {
@@ -42,7 +46,8 @@ static const uint64_t opus_channel_layouts[9] = {
     0
 };
 
-static int opus_header(AVFormatContext *s, int idx) {
+static int opus_header(AVFormatContext *s, int idx)
+{
     struct ogg *ogg = s->priv_data;
     struct ogg_stream *os = ogg->streams + idx;
     struct opus_params *op = os->private;
@@ -97,7 +102,7 @@ static int opus_header(AVFormatContext *s, int idx) {
         if (AV_RL8(p + 18) > 1)
             av_log(s, AV_LOG_WARNING, "channel mapping unrecognized\n");
 
-        avpriv_set_pts_info(st, 64, 1, st->codec->sample_rate);
+        avpriv_set_pts_info(st, 64, 1, 48000);
     } else  {
         // comment header
         if (os->psize < 8) {
@@ -118,19 +123,91 @@ static int opus_header(AVFormatContext *s, int idx) {
     return 1;
 }
 
-static uint64_t opus_gptopts(AVFormatContext *s, int idx, uint64_t granule,
-                             int64_t *dts_out)
+static int opus_packet_duration(AVFormatContext *s, const uint8_t *buf, int buf_size)
+{
+    int i, code, config, duration, frame_count;
+
+    if (buf_size > 0) {
+        i = *buf++;
+        code   = (i     ) & 0x3;
+        config = (i >> 3) & 0x1F;
+
+        if (!code || buf_size >= 2) {
+            duration = opus_frame_duration[config];
+            frame_count = (code == 0) ? 1 : (code <= 2) ? 2 : (*buf & 0x3F);
+
+            duration *= frame_count;
+            if (code > 2 && duration > 5760) {
+                av_log(s, AV_LOG_ERROR,
+                       "Opus packet duration is too long (%d samples)\n", duration);
+                return AVERROR_INVALIDDATA;
+            }
+            return duration;
+        }
+    }
+
+    av_log(s, AV_LOG_ERROR, "Opus packet is too small\n");
+    return AVERROR_INVALIDDATA;
+}
+
+static int opus_packet(AVFormatContext *s, int idx)
 {
     struct ogg *ogg = s->priv_data;
     struct ogg_stream *os = ogg->streams + idx;
     struct opus_params *op = os->private;
-    AVStream *st = s->streams[idx];
-    return (granule - op->pre_skip)*st->codec->sample_rate/48000;
+    int duration;
+
+    duration = opus_packet_duration(s, os->buf + os->pstart, os->psize);
+    if (duration < 0) {
+        av_log(s, AV_LOG_ERROR, "error parsing packet\n");
+        os->pflags |= AV_PKT_FLAG_CORRUPT;
+        return duration;
+    }
+
+    /* new ogg page */
+    if (os->granule != op->last_granule) {
+        if (op->page == 0) {/* first packet in stream */
+            os->lastpts = os->lastdts   = -op->pre_skip;
+            s->streams[idx]->start_time = op->pre_skip;
+        }if (op->page < 2)
+            op->page++;
+
+        /* too large a granule is allowed only at the beginning of the stream */
+        if (duration < op->page_duration && op->page > 1) {
+            av_log(s, AV_LOG_ERROR, "stream does not span whole Ogg page\n");
+            os->pflags |= AV_PKT_FLAG_CORRUPT;
+            return AVERROR_INVALIDDATA;
+        }
+        op->page_duration = os->granule - op->last_granule;
+        op->last_granule  = os->granule;
+    }
+
+    if (op->page_duration < duration) {
+        /* too small a granule is allowed only at the end of the stream */
+        if (!(os->flags & OGG_FLAG_EOS)) {
+            av_log(s, AV_LOG_ERROR, "stream is too long for Ogg page\n");
+            os->pflags |= AV_PKT_FLAG_CORRUPT;
+            return AVERROR_INVALIDDATA;
+        }
+        /* truncate the duration of the last packet */
+        os->pduration = op->page_duration;
+    } else os->pduration = duration;
+
+    op->page_duration -= os->pduration;
+    if (op->pre_skip)
+        op->pre_skip = (op->pre_skip > os->pduration) ? op->pre_skip - os->pduration : 0;
+    if (op->pre_skip && (os->flags & OGG_FLAG_EOS)) {
+        av_log(s, AV_LOG_ERROR, "pre-skip eliminates more samples than exist\n");
+        os->pflags |= AV_PKT_FLAG_CORRUPT;
+        return AVERROR_INVALIDDATA;
+    }
+
+    return 0;
 }
 
 const struct ogg_codec ff_opus_codec = {
     .magic     = "OpusHead",
     .magicsize = 8,
     .header    = opus_header,
-    .gptopts   = opus_gptopts,
+    .packet    = opus_packet,
 };

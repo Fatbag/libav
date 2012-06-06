@@ -36,18 +36,7 @@
 #include "get_bits.h"
 #include "bytestream.h"
 #include "unary.h"
-
-static const uint16_t config_frame_duration[32] = {
-    480, 960, 1920, 2880,
-    480, 960, 1920, 2880,
-    480, 960, 1920, 2880,
-    480, 960,
-    480, 960,
-    120, 240,  480,  960,
-    120, 240,  480,  960,
-    120, 240,  480,  960,
-    120, 240,  480,  960,
-};
+#include "opus.h"
 
 enum OpusMode {
     OPUS_MODE_SILK,
@@ -125,7 +114,7 @@ static void opus_dprint_packet(AVCodecContext *avctx, OpusPacket *pkt)
 /**
  * Read a 1- or 2-byte frame length
  */
-static inline int read_2byte_length(const uint8_t **ptr, const uint8_t *end)
+static inline int read_2byte_value(const uint8_t **ptr, const uint8_t *end)
 {
     int val;
 
@@ -143,7 +132,7 @@ static inline int read_2byte_length(const uint8_t **ptr, const uint8_t *end)
 /**
  * Read a multi-byte length (used for code 3 packet padding size)
  */
-static inline int read_multibyte_length(const uint8_t **ptr, const uint8_t *end)
+static inline int read_multibyte_value(const uint8_t **ptr, const uint8_t *end)
 {
     int val = 0;
     int next;
@@ -219,7 +208,7 @@ static int opus_parse_packet(AVCodecContext *avctx, OpusPacket *pkt,
         pkt->vbr   = 1;
 
         /* read 1st frame size */
-        frame_bytes = read_2byte_length(&ptr, end);
+        frame_bytes = read_2byte_value(&ptr, end);
         if (frame_bytes < 0)
             return AVERROR_INVALIDDATA;
         pkt->frame_offset[0] = ptr - data;
@@ -244,7 +233,7 @@ static int opus_parse_packet(AVCodecContext *avctx, OpusPacket *pkt,
 
         /* read padding size */
         if (pkt->padding) {
-            pkt->padding = read_multibyte_length(&ptr, end);
+            pkt->padding = read_multibyte_value(&ptr, end);
             if (pkt->padding < 0)
                 return AVERROR_INVALIDDATA;
         }
@@ -258,7 +247,7 @@ static int opus_parse_packet(AVCodecContext *avctx, OpusPacket *pkt,
                in the bitstream. the last frame size is implicit. */
             int total_bytes = 0;
             for (i = 0; i < pkt->frame_count - 1; i++) {
-                frame_bytes = read_2byte_length(&ptr, end);
+                frame_bytes = read_2byte_value(&ptr, end);
                 if (frame_bytes < 0)
                     return AVERROR_INVALIDDATA;
                 pkt->frame_size[i] = frame_bytes;
@@ -275,7 +264,8 @@ static int opus_parse_packet(AVCodecContext *avctx, OpusPacket *pkt,
             /* for CBR, the remaining packet bytes are divided evenly between
                the frames */
             frame_bytes = end - ptr;
-            if (frame_bytes % pkt->frame_count || frame_bytes/pkt->frame_count > MAX_FRAME_SIZE)
+            if (frame_bytes % pkt->frame_count ||
+                frame_bytes / pkt->frame_count > MAX_FRAME_SIZE)
                 return AVERROR_INVALIDDATA;
             frame_bytes /= pkt->frame_count;
             pkt->frame_offset[0] = ptr - data;
@@ -288,7 +278,7 @@ static int opus_parse_packet(AVCodecContext *avctx, OpusPacket *pkt,
     }
 
     /* total packet duration cannot be larger than 120ms */
-    pkt->frame_duration = config_frame_duration[pkt->config];
+    pkt->frame_duration = opus_frame_duration[pkt->config];
     if (pkt->frame_duration * pkt->frame_count > 5760)
         return AVERROR_INVALIDDATA;
 
@@ -334,33 +324,45 @@ static av_cold int opus_decode_close(AVCodecContext *avctx)
 static int opus_decode_frame(AVCodecContext *avctx, void *data,
                              int *got_frame_ptr, AVPacket *avpkt)
 {
-    int ret;
+    int header = 0;
+    int ret, duration;
     OpusContext *s = avctx->priv_data;
     const int buf_size = avpkt->size;
 
-    av_dlog(avctx, "--> opus_decode_frame <--\n");
+    av_dlog(avctx, "\n\n--> opus_decode_frame <--\npts: %"PRId64"\n\n", avpkt->pts);
     *got_frame_ptr = 0;
 
     /* if this is a new packet, parse its header */
     if (!s->packet.frame_count) {
-        if ((ret = opus_parse_packet(avctx, &s->packet, avpkt->data, avpkt->size)) < 0) {
+        if ((header = opus_parse_packet(avctx, &s->packet, avpkt->data, avpkt->size)) < 0) {
             av_log(avctx, AV_LOG_ERROR, "Error parsing packet\n");
-            return avpkt->size;
+            return buf_size;
         }
         s->currentframe = 0;
     }
 
-    s->frame.nb_samples = s->packet.frame_duration * avctx->sample_rate / 48000;
-    if ((ret = avctx->get_buffer(avctx, &s->frame)) < 0) {
-        av_log(avctx, AV_LOG_ERROR, "get_buffer() failed\n");
-        return ret;
+    duration = s->packet.frame_duration < avpkt->duration ?
+               s->packet.frame_duration : avpkt->duration;
+    if (duration) {
+        s->frame.nb_samples = duration * avctx->sample_rate / 48000;
+        if ((ret = avctx->get_buffer(avctx, &s->frame)) < 0) {
+            av_log(avctx, AV_LOG_ERROR, "get_buffer() failed\n");
+            return buf_size;
+        }
+        avpkt->duration -= duration;
     }
 
     *got_frame_ptr   = 1;
     *(AVFrame *)data = s->frame;
-
-    /* if this is the last frame in the packet, skip any padding that might exist at the end */
-    return (--s->packet.frame_count) ? s->packet.frame_size[s->currentframe++] : buf_size;
+    
+    if (--s->packet.frame_count && avpkt->duration) {
+        /* more frames in the packet */
+        avpkt->pts = avpkt->dts += s->packet.frame_duration;
+        return header + s->packet.frame_size[s->currentframe++];
+    }
+    
+    /* skip unused frames or padding at the end of the packet */
+    return buf_size;
 }
 
 AVCodec ff_opus_decoder = {

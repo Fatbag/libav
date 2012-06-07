@@ -38,6 +38,10 @@
 #include "unary.h"
 #include "opus.h"
 
+#define MAX_FRAME_SIZE 1275
+#define MAX_FRAMES     48
+#define MAX_FRAME_DUR  5760 /* in samples @ 48kHz */
+
 enum OpusMode {
     OPUS_MODE_SILK,
     OPUS_MODE_HYBRID,
@@ -64,9 +68,6 @@ static const char *opus_bandwidth_str[5] = {
 };
 #endif
 
-#define MAX_FRAME_SIZE 1275
-#define MAX_FRAMES     48
-
 typedef struct {
     int size;                       /** packet size */
     int code;                       /** packet code: specifies the frame layout */
@@ -84,9 +85,22 @@ typedef struct {
 } OpusPacket;
 
 typedef struct {
-    OpusPacket packet;
+    uint32_t low;           ///< low end of interval
+    uint32_t range;         ///< length of interval
+    uint32_t help;          ///< bytes_to_follow resp. intermediate value
+    unsigned int buffer;    ///< buffer for input/output
+} OpusRangeCoder;
+
+typedef struct {
+    AVCodecContext *avctx;
     AVFrame frame;
+    GetBitContext gb;
+    OpusRangeCoder c;
+
+    OpusPacket packet;
     int currentframe;
+    uint8_t *buf;
+    int buf_size;
 } OpusContext;
 
 static void opus_dprint_packet(AVCodecContext *avctx, OpusPacket *pkt)
@@ -155,13 +169,13 @@ static inline int read_multibyte_value(const uint8_t **ptr, const uint8_t *end)
  *
  * TODO: add option for self-delimited packets
  */
-
-static int opus_parse_packet(AVCodecContext *avctx, OpusPacket *pkt,
-                             const uint8_t *data, int len)
+static int opus_parse_packet(OpusContext *s)
 {
     int frame_bytes, i;
-    const uint8_t *ptr = data;
-    const uint8_t *end = data + len;
+    OpusPacket *pkt = &s->packet;
+    int len = s->buf_size;
+    const uint8_t *ptr = s->buf;
+    const uint8_t *end = s->buf + len;
 
     if (len < 1)
         return AVERROR_INVALIDDATA;
@@ -187,7 +201,7 @@ static int opus_parse_packet(AVCodecContext *avctx, OpusPacket *pkt,
         frame_bytes = end - ptr;
         if (frame_bytes > MAX_FRAME_SIZE)
             return AVERROR_INVALIDDATA;
-        pkt->frame_offset[0] = ptr - data;
+        pkt->frame_offset[0] = ptr - s->buf;
         pkt->frame_size[0]   = frame_bytes;
         break;
     case 1:
@@ -197,7 +211,7 @@ static int opus_parse_packet(AVCodecContext *avctx, OpusPacket *pkt,
         frame_bytes = end - ptr;
         if (frame_bytes & 1 || frame_bytes / 2 > MAX_FRAME_SIZE)
             return AVERROR_INVALIDDATA;
-        pkt->frame_offset[0] = ptr - data;
+        pkt->frame_offset[0] = ptr - s->buf;
         pkt->frame_size[0]   = frame_bytes / 2;
         pkt->frame_offset[1] = pkt->frame_offset[0] + pkt->frame_size[0];
         pkt->frame_size[1]   = frame_bytes / 2;
@@ -211,7 +225,7 @@ static int opus_parse_packet(AVCodecContext *avctx, OpusPacket *pkt,
         frame_bytes = read_2byte_value(&ptr, end);
         if (frame_bytes < 0)
             return AVERROR_INVALIDDATA;
-        pkt->frame_offset[0] = ptr - data;
+        pkt->frame_offset[0] = ptr - s->buf;
         pkt->frame_size[0]   = frame_bytes;
 
         /* calculate 2nd frame size */
@@ -256,7 +270,7 @@ static int opus_parse_packet(AVCodecContext *avctx, OpusPacket *pkt,
             frame_bytes = end - ptr;
             if (total_bytes > frame_bytes)
                 return AVERROR_INVALIDDATA;
-            pkt->frame_offset[0] = ptr - data;
+            pkt->frame_offset[0] = ptr - s->buf;
             for (i = 1; i < pkt->frame_count; i++)
                 pkt->frame_offset[i] = pkt->frame_offset[i-1] + pkt->frame_size[i-1];
             pkt->frame_size[pkt->frame_count-1] = frame_bytes - total_bytes;
@@ -268,7 +282,7 @@ static int opus_parse_packet(AVCodecContext *avctx, OpusPacket *pkt,
                 frame_bytes / pkt->frame_count > MAX_FRAME_SIZE)
                 return AVERROR_INVALIDDATA;
             frame_bytes /= pkt->frame_count;
-            pkt->frame_offset[0] = ptr - data;
+            pkt->frame_offset[0] = ptr - s->buf;
             pkt->frame_size[0]   = frame_bytes;
             for (i = 1; i < pkt->frame_count; i++) {
                 pkt->frame_offset[i] = pkt->frame_offset[i-1] + pkt->frame_size[i-1];
@@ -279,7 +293,7 @@ static int opus_parse_packet(AVCodecContext *avctx, OpusPacket *pkt,
 
     /* total packet duration cannot be larger than 120ms */
     pkt->frame_duration = opus_frame_duration[pkt->config];
-    if (pkt->frame_duration * pkt->frame_count > 5760)
+    if (pkt->frame_duration * pkt->frame_count > MAX_FRAME_DUR)
         return AVERROR_INVALIDDATA;
 
     /* set mode and bandwidth */
@@ -297,16 +311,20 @@ static int opus_parse_packet(AVCodecContext *avctx, OpusPacket *pkt,
             pkt->bandwidth++;
     }
 
-    opus_dprint_packet(avctx, pkt);
-    return ptr - data;
+    opus_dprint_packet(s->avctx, pkt);
+    return ptr - s->buf;
 }
+
+//static int opus_range_coder_init
 
 static av_cold int opus_decode_init(AVCodecContext *avctx)
 {
     OpusContext *s = avctx->priv_data;
 
-    av_dlog(avctx, "--> opus_decode_init <--\n");
-
+    av_dlog(avctx, "--> opus_decode_init <--\n");    
+    
+    s->avctx = avctx;
+    
     avctx->sample_fmt = AV_SAMPLE_FMT_S16;
 
     avcodec_get_frame_defaults(&s->frame);
@@ -327,42 +345,45 @@ static int opus_decode_frame(AVCodecContext *avctx, void *data,
     int header = 0;
     int ret, duration;
     OpusContext *s = avctx->priv_data;
-    const int buf_size = avpkt->size;
+    s->buf = avpkt->data;
+    s->buf_size = avpkt->size;
 
     av_dlog(avctx, "\n\n--> opus_decode_frame <--\npts: %"PRId64"\n\n", avpkt->pts);
     *got_frame_ptr = 0;
 
     /* if this is a new packet, parse its header */
     if (!s->packet.frame_count) {
-        if ((header = opus_parse_packet(avctx, &s->packet, avpkt->data, avpkt->size)) < 0) {
+        if ((header = opus_parse_packet(s)) < 0) {
             av_log(avctx, AV_LOG_ERROR, "Error parsing packet\n");
-            return buf_size;
+            return avpkt->size;
         }
+        s->buf += header;
         s->currentframe = 0;
     }
 
-    duration = s->packet.frame_duration < avpkt->duration ?
-               s->packet.frame_duration : avpkt->duration;
-    if (duration) {
-        s->frame.nb_samples = duration * avctx->sample_rate / 48000;
-        if ((ret = avctx->get_buffer(avctx, &s->frame)) < 0) {
-            av_log(avctx, AV_LOG_ERROR, "get_buffer() failed\n");
-            return buf_size;
-        }
-        avpkt->duration -= duration;
+    s->buf_size = s->packet.frame_size[s->currentframe];
+
+    duration = s->packet.frame_duration;
+    s->frame.nb_samples = duration * avctx->sample_rate / 48000;
+    if ((ret = avctx->get_buffer(avctx, &s->frame)) < 0) {
+        av_log(avctx, AV_LOG_ERROR, "get_buffer() failed\n");
+        return avpkt->size;
     }
+    
+    //opus_init_range_decoder(s);
 
     *got_frame_ptr   = 1;
     *(AVFrame *)data = s->frame;
+
+    avpkt->duration -= duration;
+    avpkt->pts = avpkt->dts += s->packet.frame_duration;
     
-    if (--s->packet.frame_count && avpkt->duration) {
-        /* more frames in the packet */
-        avpkt->pts = avpkt->dts += s->packet.frame_duration;
-        return header + s->packet.frame_size[s->currentframe++];
-    }
-    
+    /* more frames in the packet */
+    if (--s->packet.frame_count)
+        return header + s->buf_size;
+
     /* skip unused frames or padding at the end of the packet */
-    return buf_size;
+    return avpkt->size;
 }
 
 AVCodec ff_opus_decoder = {
@@ -373,6 +394,6 @@ AVCodec ff_opus_decoder = {
     .init            = opus_decode_init,
     .close           = opus_decode_close,
     .decode          = opus_decode_frame,
-    .capabilities    = CODEC_CAP_DR1,
+    .capabilities    = CODEC_CAP_DR1 | CODEC_CAP_SUBFRAMES,
     .long_name       = NULL_IF_CONFIG_SMALL("Opus"),
 };

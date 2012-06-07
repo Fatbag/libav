@@ -155,6 +155,7 @@ static int opus_packet(AVFormatContext *s, int idx)
     struct ogg *ogg = s->priv_data;
     struct ogg_stream *os = ogg->streams + idx;
     struct opus_params *op = os->private;
+    AVStream *as = s->streams[idx];
     int duration;
 
     duration = opus_packet_duration(s, os->buf + os->pstart, os->psize);
@@ -163,17 +164,17 @@ static int opus_packet(AVFormatContext *s, int idx)
         os->pflags |= AV_PKT_FLAG_CORRUPT;
         return duration;
     }
+    os->pduration = duration;
 
     /* new ogg page */
     if (os->granule != op->last_granule) {
-        if (op->page == 0) {/* first packet in stream */
-            os->lastpts = os->lastdts   = -op->pre_skip;
-            s->streams[idx]->start_time = op->pre_skip;
-        }if (op->page < 2)
+        if (op->page == 0) { /* first packet in stream */
+            os->lastpts = os->lastdts = -op->pre_skip;
+            as->duration -= op->pre_skip;
+            as->start_time = 0;
             op->page++;
-
-        /* too large a granule is allowed only at the beginning of the stream */
-        if (duration < op->page_duration && op->page > 1) {
+        } else if (duration < op->page_duration) {
+            /* too large a granule is allowed only at the beginning of the stream */
             av_log(s, AV_LOG_ERROR, "stream does not span whole Ogg page\n");
             os->pflags |= AV_PKT_FLAG_CORRUPT;
             return AVERROR_INVALIDDATA;
@@ -189,13 +190,13 @@ static int opus_packet(AVFormatContext *s, int idx)
             os->pflags |= AV_PKT_FLAG_CORRUPT;
             return AVERROR_INVALIDDATA;
         }
-        /* truncate the duration of the last packet */
-        os->pduration = op->page_duration;
-    } else os->pduration = duration;
+        /* truncate the duration of the stream */
+        as->duration      -= duration - op->page_duration;
+        op->page_duration -= duration = op->page_duration;
+    } else op->page_duration -= duration;
 
-    op->page_duration -= os->pduration;
     if (op->pre_skip)
-        op->pre_skip = (op->pre_skip > os->pduration) ? op->pre_skip - os->pduration : 0;
+        op->pre_skip -= (op->pre_skip < duration) ? op->pre_skip : duration;
     if (op->pre_skip && (os->flags & OGG_FLAG_EOS)) {
         av_log(s, AV_LOG_ERROR, "pre-skip eliminates more samples than exist\n");
         os->pflags |= AV_PKT_FLAG_CORRUPT;

@@ -321,10 +321,10 @@ static av_cold int opus_decode_init(AVCodecContext *avctx)
 {
     OpusContext *s = avctx->priv_data;
 
-    av_dlog(avctx, "--> opus_decode_init <--\n");    
-    
+    av_dlog(avctx, "--> opus_decode_init <--\n");
+
     s->avctx = avctx;
-    
+
     avctx->sample_fmt = AV_SAMPLE_FMT_S16;
 
     avcodec_get_frame_defaults(&s->frame);
@@ -369,7 +369,7 @@ static int opus_decode_frame(AVCodecContext *avctx, void *data,
         av_log(avctx, AV_LOG_ERROR, "get_buffer() failed\n");
         return avpkt->size;
     }
-    
+
     //opus_init_range_decoder(s);
 
     *got_frame_ptr   = 1;
@@ -377,7 +377,7 @@ static int opus_decode_frame(AVCodecContext *avctx, void *data,
 
     avpkt->duration -= duration;
     avpkt->pts = avpkt->dts += s->packet.frame_duration;
-    
+
     /* more frames in the packet */
     if (--s->packet.frame_count)
         return header + s->buf_size;

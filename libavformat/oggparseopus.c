@@ -172,13 +172,21 @@ static int opus_packet(AVFormatContext *s, int idx)
             os->lastpts = os->lastdts = -op->pre_skip;
             as->duration -= op->pre_skip;
             as->start_time = 0;
-            op->page++;
-        } else if (duration < op->page_duration) {
-            /* too large a granule is allowed only at the beginning of the stream */
-            av_log(s, AV_LOG_ERROR, "stream does not span whole Ogg page\n");
-            os->pflags |= AV_PKT_FLAG_CORRUPT;
-            return AVERROR_INVALIDDATA;
         }
+        if (op->page < 2)
+            op->page++;
+
+        if (duration < op->page_duration) {
+            /* too large a granule is allowed only at the beginning of the stream */
+            if (op->page > 1) {
+                av_log(s, AV_LOG_ERROR, "stream does not span whole Ogg page\n");
+                os->pflags |= AV_PKT_FLAG_CORRUPT;
+                return AVERROR_INVALIDDATA;
+            }
+            os->lastpts = os->lastdts += op->page_duration - duration;
+            as->start_time = op->page_duration - duration;
+        }
+
         op->page_duration = os->granule - op->last_granule;
         op->last_granule  = os->granule;
     }

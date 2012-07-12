@@ -19,8 +19,8 @@
  * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
  */
 
-#ifndef AVCODEC_OPUS_PARSER_H
-#define AVCODEC_OPUS_PARSER_H
+#ifndef AVCODEC_OPUS_H
+#define AVCODEC_OPUS_H
 
 #include "avcodec.h"
 
@@ -36,4 +36,4 @@ static const uint16_t opus_frame_duration[32] = {
     120, 240,  480,  960,
 };
 
-#endif /* AVCODEC_OPUS_PARSER_H */
+#endif /* AVCODEC_OPUS_H */

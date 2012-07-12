@@ -21,14 +21,14 @@
 
 /**
  * @file
- * Opus decoder by Fatbag; this is a WIP
+ * Opus decoder
+ * @author Andrew D'Addesio
  *
  * Codec homepage: http://opus-codec.org/
  * Specification: http://tools.ietf.org/html/draft-ietf-codec-opus
- * OggOpus specification: https://wiki.xiph.org/OggOpus
+ * Ogg Opus specification: http://tools.ietf.org/html/draft-terriberry-oggopus
  *
- * This decoder will only work with Ogg-contained .opus files;
- * these can be produced with opus-tools:
+ * Ogg-contained .opus files can be produced with opus-tools:
  * http://git.xiph.org/?p=opus-tools.git
  */
 
@@ -36,11 +36,16 @@
 #include "get_bits.h"
 #include "bytestream.h"
 #include "unary.h"
+#include "mathops.h"
 #include "opus.h"
+#include "opusdata.h"
 
 #define MAX_FRAME_SIZE 1275
 #define MAX_FRAMES     48
 #define MAX_FRAME_DUR  5760 /* in samples @ 48kHz */
+
+#define ROUND_MULL(a,b,s) (((MUL64(a, b) >> (s - 1)) + 1) >> 1)
+#define ilog(i) av_log2((i)<<1)
 
 enum OpusMode {
     OPUS_MODE_SILK,
@@ -91,11 +96,27 @@ typedef struct {
 } OpusRangeCoder;
 
 typedef struct {
-    int stereo_weights[2];
-    int previous_gain[2];
+    int coded;
+    int voiced;
+    int16_t nlsf[16];
+    int primarylag;
+} SilkFrame;
+
+typedef struct {
     int midonly;
     int subframes;
+    
+    SilkFrame prevframe[2];
+    int stereo_weights[2];
 } SilkContext;
+
+typedef struct {
+    int coded;
+} CeltFrame;
+
+typedef struct {
+    CeltFrame prevframe[2];
+} CeltContext;
 
 typedef struct {
     AVCodecContext *avctx;
@@ -103,17 +124,17 @@ typedef struct {
     GetBitContext gb;
     OpusRangeCoder rc;
     SilkContext silk;
-    // CeltContext celt;
+    CeltContext celt;
 
     OpusPacket packet;
     int currentframe;
     uint8_t *buf;
     int buf_size;
 
-    float output[2*MAX_FRAME_DUR]; /* stereo samples before resampling */
+    float output[2*MAX_FRAME_DUR];  /** stereo samples before resampling */
 } OpusContext;
 
-static void opus_dprint_packet(AVCodecContext *avctx, OpusPacket *pkt)
+static inline void opus_dprint_packet(AVCodecContext *avctx, OpusPacket *pkt)
 {
 #ifdef DEBUG
     int i;
@@ -176,10 +197,8 @@ static inline int read_multibyte_value(const uint8_t **ptr, const uint8_t *end)
 
 /**
  * Parse Opus packet info from raw packet data
- *
- * TODO: add option for self-delimited packets
  */
-static int opus_parse_packet(OpusContext *s)
+static inline int opus_parse_packet(OpusContext *s/*, int selfdelimited*/)
 {
     int frame_bytes, i;
     OpusPacket *pkt = &s->packet;
@@ -219,12 +238,12 @@ static int opus_parse_packet(OpusContext *s)
         pkt->frame_count = 2;
         pkt->vbr   = 0;
         frame_bytes = end - ptr;
-        if (frame_bytes & 1 || frame_bytes / 2 > MAX_FRAME_SIZE)
+        if (frame_bytes & 1 || frame_bytes >> 1 > MAX_FRAME_SIZE)
             return AVERROR_INVALIDDATA;
         pkt->frame_offset[0] = ptr - s->buf;
-        pkt->frame_size[0]   = frame_bytes / 2;
+        pkt->frame_size[0]   = frame_bytes >> 1;
         pkt->frame_offset[1] = pkt->frame_offset[0] + pkt->frame_size[0];
-        pkt->frame_size[1]   = frame_bytes / 2;
+        pkt->frame_size[1]   = frame_bytes >> 1;
         break;
     case 2:
         /* 2 frames, different sizes */
@@ -309,13 +328,13 @@ static int opus_parse_packet(OpusContext *s)
     /* set mode and bandwidth */
     if (pkt->config < 12) {
         pkt->mode = OPUS_MODE_SILK;
-        pkt->bandwidth = pkt->config / 4;
+        pkt->bandwidth = pkt->config >> 2;
     } else if (pkt->config < 16) {
         pkt->mode = OPUS_MODE_HYBRID;
         pkt->bandwidth = OPUS_BANDWIDTH_SUPERWIDEBAND + (pkt->config >= 14);
     } else {
         pkt->mode = OPUS_MODE_CELT;
-        pkt->bandwidth = (pkt->config - 16) / 4;
+        pkt->bandwidth = (pkt->config - 16) >> 2;
         /* skip mediumband */
         if (pkt->bandwidth)
             pkt->bandwidth++;
@@ -326,73 +345,8 @@ static int opus_parse_packet(OpusContext *s)
 }
 
 /**
- * Opus RangeCoder models and functions
- *
- * Models are described by CDFs rather than PDFs.
+ * Range decoder
  */
-
-static const uint16_t rc_model_bit[] = {2, 1, 2};
-
-static const uint16_t silk_model_stereo_s1[] = {
-    256,   7,   9,  10,  11,  12,  22,  46,  54,  55,  56,  59,  82, 174, 197, 200,
-    201, 202, 210, 234, 244, 245, 246, 247, 249, 256
-};
-static const uint16_t silk_model_stereo_s2[] = {256, 85, 171, 256};
-static const uint16_t silk_model_stereo_s3[] = {256, 51, 102, 154, 205, 256};
-static const uint16_t silk_model_mid_only[] = {256, 192, 256};
-static const uint16_t silk_model_frame_type_unvoiced[] = {256, 26, 256};
-static const uint16_t silk_model_frame_type_voiced[] = {256, 24, 98, 246, 256};
-static const uint16_t silk_model_gain[3][9] = {
-    {256,  32, 144, 212, 241, 253, 254, 255, 256},
-    {256,   2,  19,  64, 124, 186, 233, 252, 256},
-    {256,   1,   4,  30, 101, 195, 245, 254, 256}
-};
-static const uint16_t silk_model_gain_lsbits[] = {256, 32, 64, 96, 128, 160, 192, 224, 256};
-static const uint16_t silk_model_gain_delta[] = {
-    256,   6,  11,  22,  53, 185, 206, 214, 218, 221, 223, 225, 227, 228, 229, 230,
-    231, 232, 233, 234, 235, 236, 237, 238, 239, 240, 241, 242, 243, 244, 245, 246,
-    247, 248, 249, 250, 251, 252, 253, 254, 255, 256
-};
-static const uint16_t silk_model_lsf_s1[2][2][33] = {
-    {
-        {    // NB or MB, unvoiced
-            256,  44,  78, 108, 127, 148, 160, 171, 174, 177, 179, 195, 197, 199, 200, 205,
-            207, 208, 211, 214, 215, 216, 218, 220, 222, 225, 226, 235, 244, 246, 253, 255, 256
-        }, { // NB or MB, voiced
-            256,   1,  11,  12,  20,  23,  31,  39,  53,  66,  80,  81,  95, 107, 120, 131,
-            142, 154, 165, 175, 185, 196, 204, 213, 221, 228, 236, 237, 238, 244, 245, 251, 256
-        }
-    }, {
-        {    // WB, unvoiced
-            256,  31,  52,  55,  72,  73,  81,  98, 102, 103, 121, 137, 141, 143, 146, 147,
-            157, 158, 161, 177, 188, 204, 206, 208, 211, 213, 224, 225, 229, 238, 246, 253, 256
-        }, { // WB, voiced
-            256,   1,   5,  21,  26,  44,  55,  60,  74,  89,  90,  93, 105, 118, 132, 146,
-            152, 166, 178, 180, 186, 187, 199, 211, 222, 232, 235, 245, 250, 251, 252, 253, 256
-        }
-    }
-};
-static const uint16_t silk_model_lsf_vq2[32][10] = {
-    // NB, MB
-    {256,   1,   2,   3,  18, 242, 253, 254, 255, 256},
-    {256,   1,   2,   4,  38, 221, 253, 254, 255, 256},
-    {256,   1,   2,   6,  48, 197, 252, 254, 255, 256},
-    {256,   1,   2,  10,  62, 185, 246, 254, 255, 256},
-    {256,   1,   4,  20,  73, 174, 248, 254, 255, 256},
-    {256,   1,   4,  21,  76, 166, 239, 254, 255, 256},
-    {256,   1,   8,  32,  85, 159, 226, 252, 255, 256},
-    {256,   1,   2,  20,  83, 161, 219, 249, 255, 256},
-
-    // WB
-    {256,   1,   2,   3,  12, 244, 253, 254, 255, 256},
-    {256,   1,   2,   4,  32, 218, 253, 254, 255, 256},
-    {256,   1,   2,   5,  47, 199, 252, 254, 255, 256},
-    {256,   1,   2,  12,  61, 187, 252, 254, 255, 256},
-    {256,   1,   5,  24,  72, 172, 249, 254, 255, 256},
-    {256,   1,   2,  16,  70, 170, 242, 254, 255, 256},
-    {256,   1,   2,  17,  78, 165, 226, 251, 255, 256},
-    {256,   1,   8,  29,  79, 156, 237, 254, 255, 256}
-};
 
 static inline void opus_rc_normalize(OpusRangeCoder *rc)
 {
@@ -420,7 +374,7 @@ static unsigned int opus_rc_getsymbol(OpusRangeCoder *rc, const uint16_t *cdf)
 
     scale   = rc->range / ptotal;
     psymbol = rc->value / scale + 1;
-    psymbol = ptotal - (psymbol < ptotal ? psymbol : ptotal);
+    psymbol = ptotal - FFMIN(psymbol, ptotal);
 
     for (k = 0; (phigh = cdf[k]) <= psymbol; k++);
     plow = k ? cdf[k-1] : 0;
@@ -431,7 +385,6 @@ static unsigned int opus_rc_getsymbol(OpusRangeCoder *rc, const uint16_t *cdf)
 
     opus_rc_normalize(rc);
 
-    av_dlog(NULL, "%d <= %d < %d\n", plow, psymbol, phigh);
     return k;
 }
 
@@ -439,98 +392,361 @@ static unsigned int opus_rc_getsymbol(OpusRangeCoder *rc, const uint16_t *cdf)
  * SILK decoder
  */
 
-static const int16_t silk_stereo_weights[] = {
-    -13732, -10050,  -8266,  -7526,  -6500,  -5000,  -2950,   -820,
-       820,   2950,   5000,   6500,   7526,   8266,  10050,  13732
-};
-static const uint8_t silk_coarse_codebook_nbmb[32][10] = {
-    {0, 0, 0, 0, 0, 0, 0, 0, 0, 0},
-    {1, 3, 1, 2, 2, 1, 2, 1, 1, 1},
-    {2, 1, 1, 1, 1, 1, 1, 1, 1, 1},
-    {1, 2, 2, 2, 2, 1, 2, 1, 1, 1},
-    {2, 3, 3, 3, 3, 2, 2, 2, 2, 2},
-    {0, 5, 3, 3, 2, 2, 2, 2, 1, 1},
-    {0, 2, 2, 2, 2, 2, 2, 2, 2, 1},
-    {2, 3, 6, 4, 4, 4, 5, 4, 5, 5},
-    {2, 4, 5, 5, 4, 5, 4, 6, 4, 4},
-    {2, 4, 4, 7, 4, 5, 4, 5, 5, 4},
-    {4, 3, 3, 3, 2, 3, 2, 2, 2, 2},
-    {1, 5, 5, 6, 4, 5, 4, 5, 5, 5},
-    {2, 7, 4, 6, 5, 5, 5, 5, 5, 5},
-    {2, 7, 5, 5, 5, 5, 5, 6, 5, 4},
-    {3, 3, 5, 4, 4, 5, 4, 5, 4, 4},
-    {2, 3, 3, 5, 5, 4, 4, 4, 4, 4},
-    {2, 4, 4, 6, 4, 5, 4, 5, 5, 5},
-    {2, 5, 4, 6, 5, 5, 5, 4, 5, 4},
-    {2, 7, 4, 5, 4, 5, 4, 5, 5, 5},
-    {2, 5, 4, 6, 7, 6, 5, 6, 5, 4},
-    {3, 6, 7, 4, 6, 5, 5, 6, 4, 5},
-    {2, 7, 6, 4, 4, 4, 5, 4, 5, 5},
-    {4, 5, 5, 4, 6, 6, 5, 6, 5, 4},
-    {2, 5, 5, 6, 5, 6, 4, 6, 4, 4},
-    {4, 5, 5, 5, 3, 7, 4, 5, 5, 4},
-    {2, 3, 4, 5, 5, 6, 4, 5, 5, 4},
-    {2, 3, 2, 3, 3, 4, 2, 3, 3, 3},
-    {1, 1, 2, 2, 2, 2, 2, 3, 2, 2},
-    {4, 5, 5, 6, 6, 6, 5, 6, 4, 5},
-    {3, 5, 5, 4, 4, 4, 4, 3, 3, 2},
-    {2, 5, 3, 7, 5, 5, 4, 4, 5, 4},
-    {4, 4, 5, 4, 5, 6, 5, 6, 5, 4}
-};
-static const uint8_t silk_coarse_codebook_wb[32][16] = {
-    { 8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8},
-    {10, 11, 11, 11, 11, 11, 10, 10, 10, 10, 10,  9,  9,  9,  8, 11},
-    {10, 13, 13, 11, 15, 12, 12, 13, 10, 13, 12, 13, 13, 12, 11, 11},
-    { 8, 10,  9, 10, 10,  9,  9,  9,  9,  9,  8,  8,  8,  8,  8,  9},
-    { 8, 14, 13, 12, 14, 12, 15, 13, 12, 12, 12, 13, 13, 12, 12, 11},
-    { 8, 11, 13, 13, 12, 11, 11, 13, 11, 11, 11, 11, 11, 11, 10, 12},
-    { 8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8},
-    { 8, 10, 14, 11, 15, 10, 13, 11, 12, 13, 13, 12, 11, 11, 10, 11},
-    { 8, 14, 10, 14, 14, 12, 13, 12, 14, 13, 12, 12, 13, 11, 11, 11},
-    {10,  9,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8},
-    { 8,  9,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  9},
-    {10, 10, 11, 12, 13, 11, 11, 11, 11, 11, 11, 11, 10, 10,  9, 11},
-    {10, 10, 11, 11, 12, 11, 11, 11, 11, 11, 11, 11, 11, 10,  9, 11},
-    {11, 12, 12, 12, 14, 12, 12, 13, 11, 13, 12, 12, 13, 12, 11, 12},
-    { 8, 14, 12, 13, 12, 15, 13, 10, 14, 13, 15, 12, 12, 11, 13, 11},
-    { 8,  9,  8,  9,  9,  9,  9,  9,  9,  9,  8,  8,  8,  8,  9,  8},
-    { 9, 14, 13, 15, 13, 12, 13, 11, 12, 13, 12, 12, 12, 11, 11, 12},
-    { 9, 11, 11, 12, 12, 11, 11, 13, 10, 11, 11, 13, 13, 13, 11, 12},
-    {10, 11, 11, 10, 10, 10, 11, 10,  9, 10,  9, 10,  9,  9,  9, 12},
-    { 8, 10, 11, 13, 11, 11, 10, 10, 10,  9,  9,  8,  8,  8,  8,  8},
-    {11, 12, 11, 13, 11, 11, 10, 10,  9,  9,  9,  9,  9, 10, 10, 12},
-    {10, 14, 11, 15, 15, 12, 13, 12, 13, 11, 13, 11, 11, 10, 11, 11},
-    {10, 11, 13, 14, 14, 11, 13, 11, 12, 12, 11, 11, 11, 11, 10, 12},
-    { 9, 11, 11, 12, 12, 12, 12, 11, 13, 13, 13, 11,  9,  9,  9,  9},
-    {10, 13, 11, 14, 14, 12, 15, 12, 12, 13, 11, 12, 12, 11, 11, 11},
-    { 8, 14,  9,  9,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8,  8},
-    { 8, 14, 14, 11, 13, 10, 13, 13, 11, 12, 12, 15, 15, 12, 12, 12},
-    {11, 11, 15, 11, 13, 12, 11, 11, 11, 10, 10, 11, 11, 11, 10, 11},
-    { 8,  8,  9,  8,  8,  8, 10,  9, 10,  9,  9, 10, 10, 10,  9,  9},
-    { 8, 11, 10, 13, 11, 11, 10, 11, 10,  9,  8,  8,  9,  8,  8,  9},
-    {11, 13, 13, 12, 15, 13, 11, 11, 10, 11, 10, 10,  9,  8,  9,  8},
-    {10, 11, 13, 11, 12, 11, 11, 11, 10,  9, 10, 14, 12,  8,  8,  8}
-};
-
-static int silk_decode_frame(OpusContext *s, int frame, int channel, int active)
+static inline void silk_stabilize_lsf(int16_t nlsf[16], int order, const uint16_t min_delta[17])
 {
-    int i, j, subframe, order;
-    int voiced, qoffset_high, gain_indices[4], vq_index;
-    int lsf_coeff[16];
+    int pass;
+    for (pass = 0; 1; pass++) {
+        int i, k, min_diff = 0;
+        for (i = 0; i < order+1; i++) {
+            int low  = i != 0     ? nlsf[i-1] : 0;
+            int high = i != order ? nlsf[i]   : 32768;
+            int diff = (high - low) - (min_delta[i]);
+
+            if (diff < min_diff) {
+                min_diff = diff;
+                k = i;
+
+                if (pass == 20)
+                    break;
+            }
+        }
+        if (min_diff == 0) /* no issues; stabilized */
+            return;
+
+        if (pass != 20) {
+            /* wiggle one or two LSFs */
+            if (k == 0) {
+                /* repel away from lower bound */
+                nlsf[0] = min_delta[0];
+            } else if (k == order) {
+                /* repel away from higher bound */
+                nlsf[order-1] = 32768 - min_delta[order];
+            } else {
+                /* repel away from current position */
+                int min_center = 0, max_center = 32768, center_val;
+
+                /* lower extent */
+                for (i = 0; i < k; i++)
+                    min_center += min_delta[i];
+                min_center += min_delta[k] >> 1;
+
+                /* upper extent */
+                for (i = order; i > k; i--)
+                    max_center -= min_delta[k];
+                max_center -= min_delta[k] >> 1;
+
+                /* move apart */
+                center_val = nlsf[k-1] + nlsf[k];
+                center_val = (center_val>>1) + (center_val&1); // rounded divide by 2
+                if (center_val < min_center)      center_val = min_center;
+                else if (center_val > max_center) center_val = max_center;
+                nlsf[k-1] = center_val - (min_delta[k]>>1);
+                nlsf[k] = nlsf[k-1] + min_delta[k];
+            }
+        } else {
+            /* resort to the fall-back method, the standard method for LSF stabilization */
+
+            /* sort; as the LSFs should be nearly sorted, use insertion sort */
+            for (i = 1; i < order; i++) {
+                int j, value = nlsf[i];
+                for (j = i-1; j >= 0 && nlsf[j] > value; j--)
+                    nlsf[j+1] = nlsf[j];
+                nlsf[j+1] = value;
+            }
+
+            /* push forwards to increase distance */
+            if (nlsf[0] < min_delta[0])
+                nlsf[0] = min_delta[0];
+            for (i = 1; i < order; i++)
+                if (nlsf[i] < nlsf[i-1] + min_delta[i])
+                    nlsf[i] = nlsf[i-1] + min_delta[i];
+
+            /* push backwards to increase distance */
+            if (nlsf[order-1] > 32768 - min_delta[order])
+                nlsf[order-1] = 32768 - min_delta[order];
+            for (i = order-2; i >= 0; i--)
+                if (nlsf[i] > nlsf[i+1] - min_delta[i+1])
+                    nlsf[i] = nlsf[i+1] - min_delta[i+1];
+
+            return;
+        }
+    }
+}
+
+static inline int silk_is_lpc_stable(const int16_t lpc[16], int order)
+{
+    int k, j, DC_resp = 0;
+    int32_t lpc32[2][16];       // Q24
+    int totalinvgain = 1 << 30; // 1.0 in Q30
+    int32_t *row = lpc32[0], *prevrow;
+
+    /* initialize the first row for the Levinson recursion */
+    for (k = 0; k < order; k++) {
+        DC_resp += lpc[k];
+        row[k] = lpc[k] << 12;
+    }
+
+    if (DC_resp >= 4096)
+        return 0;
+
+    /* check if prediction gain pushes any coefficients too far */
+    for (k = order - 1; 1; k--) {
+        int rc;      // Q31; reflection coefficient
+        int gaindiv; // Q30; inverse of the gain (the divisor)
+        int gain;    // gain for this reflection coefficient
+        int fbits;   // fractional bits used for the gain
+        int error;   // Q29; estimate of the error of our partial estimate of 1/gaindiv
+
+        if (FFABS(row[k]) > 16773022)
+            return 0;
+
+        rc      = -(row[k] << 7);
+        gaindiv = (1<<30) - MULH(rc, rc);
+
+        totalinvgain = MULH(totalinvgain, gaindiv) << 2;
+        if (k == 0)
+            return (totalinvgain >= 107374);
+
+        /* approximate 1.0/gaindiv */
+        fbits = ilog(gaindiv);
+        gain  = ((1<<29) - 1) / (gaindiv >> (fbits+1-16)); // Q<fbits-16>
+        error = (1<<29) - MULL(gaindiv << (15+16-fbits), gain, 16);
+        gain  = ((gain << 16) + (error*gain >> 13));
+
+        /* switch to the next row of the LPC coefficients */
+        prevrow = row;
+        row = lpc32[k & 1];
+
+        for (j = 0; j < k; j++) {
+            int x = prevrow[j] - ROUND_MULL(prevrow[k-j-1], rc, 31);
+            row[j] = ROUND_MULL(x, gain, fbits);
+        }
+    }
+}
+
+static void silk_lsp2poly(const int32_t lsp[16], int32_t pol[16], int half_order)
+{
+    int i, j;
+
+    pol[0] = 65536; // 1.0 in Q16
+    pol[1] = -lsp[0];
+
+    for (i = 1; i < half_order; i++) {
+        pol[i+1] = (pol[i-1] << 1) - ROUND_MULL(lsp[2*i], pol[i], 16);
+        for (j = i; j > 1; j--)
+            pol[j] += pol[j-2] - ROUND_MULL(lsp[2*i], pol[j-1], 16);
+
+        pol[1] -= lsp[2*i];
+    }
+}
+
+static void silk_lsf2lpc(const int16_t nlsf[16], int16_t lpc[16], int order)
+{
+    int i, k;
+    int32_t lsp[16];    // Q17; 2*cos(LSF)
+    int32_t p[9], q[9]; // Q16
+    int32_t lpc32[16];  // Q17
+
+    /* convert the LSFs to LSPs, i.e. 2*cos(LSF) */
+    for (k = 0; k < order; k++) {
+        int index = nlsf[k] >> 8;
+        int offset = nlsf[k] & 255;
+        int k2 = (order == 10) ? silk_lsf_ordering_nbmb[k] : silk_lsf_ordering_wb[k];
+
+        /* interpolate and round */
+        lsp[k2]  = silk_cosine[index] << 8;
+        lsp[k2] += (silk_cosine[index+1] - silk_cosine[index])*offset;
+        lsp[k2]  = (lsp[k2] + 4) >> 3;
+    }
+
+    silk_lsp2poly(lsp  , p, order>>1);
+    silk_lsp2poly(lsp+1, q, order>>1);
+
+    /* reconstruct A(z) */
+    for (k = 0; k < order>>1; k++) {
+        lpc32[k]         = -p[k+1] - p[k] - q[k+1] + q[k];
+        lpc32[order-k-1] = -p[k+1] - p[k] + q[k+1] - q[k];
+    }
+
+    /* limit the range of the LPC coefficients to each fit within an int16_t */
+    for (i = 0; i < 10; i++) {
+        int j;
+        unsigned int maxabs = 0;
+        for (j = 0, k = 0; j < order; j++) {
+            unsigned int x = FFABS(lpc32[k]);
+            if (x > maxabs) {
+                maxabs = x; // Q17
+                k      = j;
+            }
+        }
+
+        maxabs = (maxabs + 16) >> 5; // convert to Q12
+
+        if (maxabs > 32767) {
+            /* perform bandwidth expansion */
+            unsigned int chirp, chirp_base; // Q16
+            maxabs = FFMIN(maxabs, 163838); // anything above this overflows chirp's numerator
+            chirp_base = chirp = 65470 - ((maxabs - 32767) << 14) / ((maxabs * (k+1)) >> 2);
+
+            for (k = 0; k < order; k++) {
+                lpc32[k] = ROUND_MULL(lpc32[k], chirp, 16);
+                chirp    = (chirp_base * chirp + 32768) >> 16;
+            }
+        } else break;
+    }
+
+    if (i == 10) {
+        /* time's up: just clamp */
+        for (k = 0; k < order; k++) {
+            int x = (lpc32[k] + 16) >> 5;
+            lpc[k] = av_clip_int16(x);
+            lpc32[k] = lpc[k] << 5; // shortcut mandated by the spec; drops lower 5 bits
+        }
+    } else {
+        for (k = 0; k < order; k++)
+            lpc[k] = (lpc32[k] + 16) >> 5;
+    }
+
+    /* if the prediction gain causes the LPC filter to become unstable,
+       apply further bandwidth expansion on the Q17 coefficients */
+    for (i = 1; i <= 16 && !silk_is_lpc_stable(lpc, order); i++) {
+        unsigned int chirp, chirp_base;
+        chirp_base = chirp = 65536 - (1 << i);
+
+        for (k = 0; k < order; k++) {
+            lpc32[k] = ROUND_MULL(lpc32[k], chirp, 16);
+            lpc[k]   = (lpc32[k] + 16) >> 5;
+            chirp    = (chirp_base * chirp + 32768) >> 16;
+        }
+    }
+}
+
+static inline void silk_decode_lpc(OpusContext *s, int16_t lpc_leadin[16], int16_t lpc[16],
+                                   int *has_lpc_leadin, int voiced, int channel)
+{
+    int i;
+    int order;                         // order of the LP polynomial; 10 for NB/MB and 16 for WB
+    int8_t  lsf_i1, lsf_i2[16];        // stage-1 and stage-2 codebook indices
+    int16_t lsf_res[16];               // residual as a Q10 value
+    int16_t nlsf_leadin[16], nlsf[16]; // Q15
+    
+    /* obtain LSF stage-1 and stage-2 indices */
+    lsf_i1 = opus_rc_getsymbol(&s->rc, silk_model_lsf_s1[s->packet.bandwidth ==
+                                       OPUS_BANDWIDTH_WIDEBAND][voiced]);
+    order = (s->packet.bandwidth != OPUS_BANDWIDTH_WIDEBAND) ? 10 : 16;
+    for (i = 0; i < order; i++) {
+        int index = (s->packet.bandwidth != OPUS_BANDWIDTH_WIDEBAND)
+                    ? silk_lsf_s2_model_sel_nbmb[lsf_i1][i]
+                    : silk_lsf_s2_model_sel_wb[lsf_i1][i];
+        lsf_i2[i] = opus_rc_getsymbol(&s->rc, silk_model_lsf_s2[index]) - 4;
+        if (lsf_i2[i] == -4)     lsf_i2[i] -= opus_rc_getsymbol(&s->rc, silk_model_lsf_s2_ext);
+        else if (lsf_i2[i] == 4) lsf_i2[i] += opus_rc_getsymbol(&s->rc, silk_model_lsf_s2_ext);
+    }
+
+    /* reverse the backwards-prediction step */
+    for (i = order - 1; i >= 0; i--) {
+        int qstep = (s->packet.bandwidth != OPUS_BANDWIDTH_WIDEBAND) ? 11796 : 9830;
+
+        lsf_res[i] = lsf_i2[i] << 10;
+        if (lsf_i2[i] < 0)      lsf_res[i] += 102;
+        else if (lsf_i2[i] > 0) lsf_res[i] -= 102;
+        lsf_res[i] = (lsf_res[i] * qstep) >> 16;
+
+        if (i+1 < order) {
+            int weight = (s->packet.bandwidth != OPUS_BANDWIDTH_WIDEBAND)
+                         ? silk_lsf_pred_weights_nbmb[silk_lsf_weight_sel_nbmb[lsf_i1][i]][i]
+                         : silk_lsf_pred_weights_wb[silk_lsf_weight_sel_wb[lsf_i1][i]][i];
+            lsf_res[i] += (lsf_res[i+1] * weight) >> 8;
+        }
+    }
+
+    /* reconstruct the NLSF coefficients from the supplied indices */
+    for (i = 0; i < order; i++) {
+        const uint8_t * codebook = (s->packet.bandwidth != OPUS_BANDWIDTH_WIDEBAND)
+                                   ? silk_lsf_codebook_nbmb[lsf_i1]
+                                   : silk_lsf_codebook_wb[lsf_i1];
+        int cur, prev, next, weight_sq, weight, ipart, fpart, y, value;
+
+        /* find the weight of the residual */
+        /* TODO: precompute */
+        cur = codebook[i];
+        prev = i ? codebook[i-1] : 0;
+        next = i+1 < order ? codebook[i+1] : 256;
+        weight_sq = (1024/(cur - prev) + 1024/(next - cur)) << 16;
+
+        /* approximate square-root with mandated fixed-point arithmetic */
+        ipart = ilog(weight_sq);
+        fpart = (weight_sq >> (ipart-8)) & 127;
+        y = ((ipart&1) ? 32768 : 46214) >> ((32-ipart)>>1);
+        weight = y + ((213*fpart*y) >> 16);
+
+        value = (cur << 7) + (lsf_res[i] << 14) / weight;
+        nlsf[i] = av_clip(value, 0, 32767);
+    }
+
+    /* stabilize the NLSF coefficients */
+    silk_stabilize_lsf(nlsf, order, (s->packet.bandwidth != OPUS_BANDWIDTH_WIDEBAND)
+                                    ? silk_lsf_min_spacing_nbmb : silk_lsf_min_spacing_wb);
+
+    /* produce an interpolation for the first 2 subframes */
+    *has_lpc_leadin = 0;
+    if (s->silk.subframes == 4) {
+        int offset = opus_rc_getsymbol(&s->rc, silk_model_lsf_interpolation_offset);
+        if (offset != 4 && s->silk.prevframe[channel].coded) {
+            *has_lpc_leadin = 1;
+            for (i = 0; i < order; i++)
+                nlsf_leadin[i] = s->silk.prevframe[channel].nlsf[i] +
+                                 ((nlsf[i] - s->silk.prevframe[channel].nlsf[i])*offset >> 2);
+        }
+    }
+    memcpy(s->silk.prevframe[channel].nlsf, nlsf, sizeof(nlsf));
+
+    /* convert both sets of NLSFs to LPC coefficients */
+    if (*has_lpc_leadin)
+        silk_lsf2lpc(nlsf_leadin, lpc_leadin, order);
+    silk_lsf2lpc(nlsf, lpc, order);
+}
+
+static inline int silk_decode_frame(OpusContext *s, int frame, int channel, int active)
+{
+    int i, j;
+
+    /* per frame */
+    int voiced;       // combines with active to indicate inactive, active, or active+voiced
+    int qoffset_high;
+    int16_t lpc_leadin[16], lpc[16]; // Q12
+    int has_lpc_leadin;
+    int ltpfilter;
+    int ltpscale;
+    int seed;
+    int shellblocks;
+    int ratelevel;
+    uint8_t pulsecount[20];      // per shell block
+    uint8_t lsbcount[20] = {0};  // LSB count per coefficient per shell block
+    uint8_t pulses[20][8] = {{0}}; // physical count of pulses in each shell block
+
+    /* per subframe */
+    struct {
+        int gain_index;
+        int pitchlag;
+        const int8_t *ltp;
+    } sf[4];
+    
+    SilkFrame * const prevframe = s->silk.prevframe + channel;
 
     /* obtain stereo weights */
     if (s->packet.stereo && channel == 0) {
-        int n, c[2], wi[2];
+        int n, wi[2], ws[2];
         n     = opus_rc_getsymbol(&s->rc, silk_model_stereo_s1);
         wi[0] = opus_rc_getsymbol(&s->rc, silk_model_stereo_s2) + 3*(n/5);
-         c[0] = opus_rc_getsymbol(&s->rc, silk_model_stereo_s3);
+        ws[0] = opus_rc_getsymbol(&s->rc, silk_model_stereo_s3);
         wi[1] = opus_rc_getsymbol(&s->rc, silk_model_stereo_s2) + 3*(n%5);
-         c[1] = opus_rc_getsymbol(&s->rc, silk_model_stereo_s3);
+        ws[1] = opus_rc_getsymbol(&s->rc, silk_model_stereo_s3);
 
         for (i=0; i<2; i++)
             s->silk.stereo_weights[i] = silk_stereo_weights[wi[i]]
                 + (((silk_stereo_weights[wi[i]+1] - silk_stereo_weights[wi[i]]) * 6554) >> 16)
-                    * (2*c[i] + 1);
+                    * (ws[i]*2 + 1);
 
         s->silk.stereo_weights[0] -= s->silk.stereo_weights[1];
 
@@ -540,42 +756,136 @@ static int silk_decode_frame(OpusContext *s, int frame, int channel, int active)
 
     /* obtain frame type */
     if (!active) {
-        qoffset_high = opus_rc_getsymbol(&s->rc, silk_model_frame_type_unvoiced);
+        qoffset_high = opus_rc_getsymbol(&s->rc, silk_model_frame_type_inactive);
         voiced = 0;
     } else {
-        int type = opus_rc_getsymbol(&s->rc, silk_model_frame_type_voiced);
+        int type = opus_rc_getsymbol(&s->rc, silk_model_frame_type_active);
         qoffset_high = type & 1;
-        voiced = (type & 2) >> 1;
+        voiced = type >> 1;
     }
 
-    /* obtain subframe quantization gain indices */
-    for (subframe = 0; subframe < s->silk.subframes; subframe++) {
-        if (subframe == 0 && frame == 0) {
+    /* obtain subframe quantization gains */
+    for (i = 0; i < s->silk.subframes; i++) {
+        if (i == 0 && (frame == 0 || !prevframe->coded)) {
             /* gain index is coded absolute */
-            int x = opus_rc_getsymbol(&s->rc, silk_model_gain[active + voiced]);
-            gain_indices[0] = (x<<3) | opus_rc_getsymbol(&s->rc, silk_model_gain_lsbits);
+            int x = opus_rc_getsymbol(&s->rc, silk_model_gain_highbits[active + voiced]);
+            sf[i].gain_index = (x<<3) | opus_rc_getsymbol(&s->rc, silk_model_gain_lowbits);
         } else {
             /* gain index is coded relative */
-            gain_indices[0] = opus_rc_getsymbol(&s->rc, silk_model_gain_delta);
+            sf[i].gain_index = opus_rc_getsymbol(&s->rc, silk_model_gain_delta);
         }
     }
-
-    /* obtain normalized LSF coefficients */
-    vq_index = opus_rc_getsymbol(&s->rc, silk_model_lsf_s1[s->packet.bandwidth ==
-                                         OPUS_BANDWIDTH_WIDEBAND][voiced]);
-    order = (s->packet.bandwidth != OPUS_BANDWIDTH_WIDEBAND) ? 10 : 16;
-    for (i = 0; i < order; i++) {
-        int index = (s->packet.bandwidth != OPUS_BANDWIDTH_WIDEBAND)
-                    ? silk_coarse_codebook_nbmb[order][i] : silk_coarse_codebook_wb[order][i];
-        lsf_coeff[i] = opus_rc_getsymbol(&s->rc, silk_model_lsf_vq2[index]);
+    
+    /* obtain LPC filter coefficients */
+    silk_decode_lpc(s, lpc_leadin, lpc, &has_lpc_leadin, voiced, channel);
+    
+    /* obtain pitch lags, if this is a voiced frame */
+    if (voiced) {
+        int primarylag;        // primary pitch lag for the entire SILK frame
+        const int8_t * offsets;
+        
+        if (frame == 0 || !prevframe->coded || !prevframe->voiced) {
+            /* primary lag is coded absolute */
+            int highbits, lowbits;
+            const uint16_t *model[] = {
+                silk_model_pitch_lowbits_nb, silk_model_pitch_lowbits_mb, 
+                silk_model_pitch_lowbits_wb
+            };
+            highbits = opus_rc_getsymbol(&s->rc, silk_model_pitch_highbits);
+            lowbits  = opus_rc_getsymbol(&s->rc, model[s->packet.bandwidth]);
+            
+            primarylag = silk_pitch_min_lag[s->packet.bandwidth] +
+                         highbits*silk_pitch_scale[s->packet.bandwidth] + lowbits;
+        } else {
+            /* primary lag is coded relative */
+            primarylag = prevframe->primarylag +
+                         opus_rc_getsymbol(&s->rc, silk_model_pitch_delta) - 9;
+        }
+        prevframe->primarylag = primarylag;
+        
+        if (s->silk.subframes == 2)
+            offsets = (s->packet.bandwidth == OPUS_BANDWIDTH_NARROWBAND)
+                     ? silk_pitch_offset_nb10ms[opus_rc_getsymbol(&s->rc,
+                                                silk_model_pitch_contour_nb10ms)]
+                     : silk_pitch_offset_mbwb10ms[opus_rc_getsymbol(&s->rc,
+                                                silk_model_pitch_contour_mbwb10ms)];
+        else
+            offsets = (s->packet.bandwidth == OPUS_BANDWIDTH_NARROWBAND)
+                     ? silk_pitch_offset_nb20ms[opus_rc_getsymbol(&s->rc,
+                                                silk_model_pitch_contour_nb20ms)]
+                     : silk_pitch_offset_mbwb20ms[opus_rc_getsymbol(&s->rc,
+                                                silk_model_pitch_contour_mbwb20ms)];
+        
+        for (i = 0; i < s->silk.subframes; i++)
+            sf[i].pitchlag = av_clip(primarylag + offsets[i],
+                                     silk_pitch_min_lag[s->packet.bandwidth],
+                                     silk_pitch_max_lag[s->packet.bandwidth]);
     }
+    
+    /* obtain LTP filter coefficients */
+    ltpfilter = opus_rc_getsymbol(&s->rc, silk_model_ltp_filter);
+    for (i = 0; i < s->silk.subframes; i++) {
+        int index;
+        const uint16_t *filter_sel[] = {
+            silk_model_ltp_filter0_sel, silk_model_ltp_filter1_sel, silk_model_ltp_filter2_sel
+        };
+        const int8_t (*filter_taps[])[5] = {
+            silk_ltp_filter0_taps, silk_ltp_filter1_taps, silk_ltp_filter2_taps
+        };
+        index = opus_rc_getsymbol(&s->rc, filter_sel[ltpfilter]);
+        sf[i].ltp = filter_taps[ltpfilter][index];
+    }
+    
+    /* obtain LTP scale factor */
+    if (voiced && frame == 0)
+        ltpscale = silk_ltp_scale_factor[opus_rc_getsymbol(&s->rc, silk_model_ltp_scale_index)];
+    else ltpscale = 15565;
+    
+    /* obtain PRNG seed */
+    seed = opus_rc_getsymbol(&s->rc, silk_model_lcg_seed);
+    
+    /* obtain excitation parameters */
+    shellblocks = silk_shell_blocks[s->packet.bandwidth][s->silk.subframes >> 2];
+    ratelevel = opus_rc_getsymbol(&s->rc, silk_model_exc_rate[voiced]);
+    
+    for (i = 0; i < shellblocks; i++) {
+        pulsecount[i] = opus_rc_getsymbol(&s->rc, silk_model_pulse_count[ratelevel]);
+        if (pulsecount[i] == 17) {
+            lsbcount[i]++;
+            for (j = 0; j < 10; j++) {
+                pulsecount[i] = opus_rc_getsymbol(&s->rc, silk_model_pulse_count[9]);
+                if (pulsecount[i] == 17)
+                    lsbcount[i]++;
+                else break;
+            }
+            if (j == 10)
+                pulsecount[i] = opus_rc_getsymbol(&s->rc, silk_model_pulse_count[10]);
+        }
+    }
+    
+    /* for (i = 0; i < shellblocks; i++) {
+        decode_split(s, &pulses3[0], &pulses3[1], pulses4, silk_shell_code_table3);
+    } */
+    
+    /* for (i = 0; i < shellblocks; i++) {
+        silk_model_excitation_lsb
+    } */
+
     return 0;
 }
+
+/**
+ * CELT decoder
+ */
 
 static int celt_decode_frame(OpusContext *s)
 {
     return 0;
 }
+
+/**
+ * Opus stream decoder
+ */
 
 static av_cold int opus_decode_init(AVCodecContext *avctx)
 {
@@ -623,9 +933,6 @@ static int opus_decode_frame(AVCodecContext *avctx, void *data,
 
         s->buf += header;
         s->currentframe = 0;
-        av_dlog(avctx, "TEST 1: %.4X %.4X %.4X %.4X %.4X %.4X %.4X %.4X %.4X %.4X\n",
-            s->buf[0], s->buf[1], s->buf[2], s->buf[3], s->buf[4],
-            s->buf[5], s->buf[6], s->buf[7], s->buf[8], s->buf[9]);
     }
 
     s->buf_size = s->packet.frame_size[s->currentframe];
@@ -646,10 +953,7 @@ static int opus_decode_frame(AVCodecContext *avctx, void *data,
 
         silkframes        = 1 + (s->packet.frame_duration >= 1920)
                               + (s->packet.frame_duration == 2880);
-        s->silk.subframes = (s->packet.frame_duration == 960) ? 2 : 4; // per whole SILK frame
-
-        if (!s->packet.stereo)
-            s->silk.previous_gain[1] = 0;
+        s->silk.subframes = (s->packet.frame_duration == 480) ? 2 : 4; // per whole SILK frame
 
         /* read the LP-layer header bits */
         for (i = 0; i <= s->packet.stereo; i++) {
@@ -669,16 +973,26 @@ static int opus_decode_frame(AVCodecContext *avctx, void *data,
                     av_log(avctx, AV_LOG_ERROR, "Error reading SILK frame\n");
                     return ret;
                 }
+                
+                s->silk.prevframe[0].coded = 1;
+                s->silk.prevframe[1].coded = s->packet.stereo;
             }
         }
     } else {
-        s->silk.previous_gain[0] = 0;
-        s->silk.previous_gain[1] = 0;
+        s->silk.prevframe[0].coded = 0;
+        s->silk.prevframe[0].coded = 0;
     }
 
     if (s->packet.mode == OPUS_MODE_CELT || s->packet.mode == OPUS_MODE_HYBRID) {
-        /* Decode a CELT frame */
+        /* decode a CELT frame */
+        av_log(avctx, AV_LOG_ERROR, "CELT frame in input\n");
         celt_decode_frame(s);
+
+        s->celt.prevframe[0].coded = 1;
+        s->celt.prevframe[1].coded = 1;
+    } else {
+        s->celt.prevframe[0].coded = 0;
+        s->celt.prevframe[1].coded = 0;
     }
 
     *got_frame_ptr   = 1;
@@ -688,7 +1002,7 @@ static int opus_decode_frame(AVCodecContext *avctx, void *data,
     avpkt->pts = avpkt->dts += s->packet.frame_duration;
 
     /* more frames in the packet */
-    if (++s->currentframe == s->packet.frame_count)
+    if (++s->currentframe != s->packet.frame_count)
         return header + s->buf_size;
 
     /* skip padding at the end of the packet */

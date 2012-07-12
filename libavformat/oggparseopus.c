@@ -196,7 +196,7 @@ static int opus_packet(AVFormatContext *s, int idx)
     } else op->page_duration -= duration;
 
     if (op->pre_skip)
-        op->pre_skip -= (op->pre_skip < duration) ? op->pre_skip : duration;
+        op->pre_skip -= FFMIN(op->pre_skip, duration);
     if (op->pre_skip && (os->flags & OGG_FLAG_EOS)) {
         av_log(s, AV_LOG_ERROR, "pre-skip eliminates more samples than exist\n");
         os->pflags |= AV_PKT_FLAG_CORRUPT;

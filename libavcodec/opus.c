@@ -37,6 +37,7 @@
 #include "bytestream.h"
 #include "unary.h"
 #include "mathops.h"
+#include "celp_filters.h"
 #include "opus.h"
 #include "opusdata.h"
 
@@ -90,7 +91,15 @@ typedef struct {
 } OpusPacket;
 
 typedef struct {
+    const uint8_t *position;
+    uint8_t byte;
+    unsigned int unreadbits;
+    unsigned int cache;
+} RawBitsContext;
+
+typedef struct {
     GetBitContext *gb;
+    RawBitsContext rb;
     unsigned int range;
     unsigned int value;
 } OpusRangeCoder;
@@ -98,14 +107,19 @@ typedef struct {
 typedef struct {
     int coded;
     int voiced;
+    int log_gain;
     int16_t nlsf[16];
+    int16_t lpc[16];
+    float output[320];
     int primarylag;
 } SilkFrame;
 
 typedef struct {
     int midonly;
     int subframes;
-    
+    int sflength;
+    int flength;
+
     SilkFrame prevframe[2];
     int stereo_weights[2];
 } SilkContext;
@@ -131,7 +145,7 @@ typedef struct {
     uint8_t *buf;
     int buf_size;
 
-    float output[2*MAX_FRAME_DUR];  /** stereo samples before resampling */
+    float output[2*MAX_FRAME_DUR];  /** stereo samples @ 48kHz */
 } OpusContext;
 
 static inline void opus_dprint_packet(AVCodecContext *avctx, OpusPacket *pkt)
@@ -198,7 +212,7 @@ static inline int read_multibyte_value(const uint8_t **ptr, const uint8_t *end)
 /**
  * Parse Opus packet info from raw packet data
  */
-static inline int opus_parse_packet(OpusContext *s/*, int selfdelimited*/)
+static inline int opus_parse_packet(OpusContext *s, int selfdelimited)
 {
     int frame_bytes, i;
     OpusPacket *pkt = &s->packet;
@@ -340,6 +354,11 @@ static inline int opus_parse_packet(OpusContext *s/*, int selfdelimited*/)
             pkt->bandwidth++;
     }
 
+    /* update the raw bits location in the entropy decoder */
+    s->rc.rb.position = end + pkt->padding;
+    s->rc.rb.cache = 8;
+    s->rc.rb.byte  = s->rc.rb.position[0];
+
     opus_dprint_packet(s->avctx, pkt);
     return ptr - s->buf;
 }
@@ -386,6 +405,76 @@ static unsigned int opus_rc_getsymbol(OpusRangeCoder *rc, const uint16_t *cdf)
     opus_rc_normalize(rc);
 
     return k;
+}
+
+static unsigned int opus_rc_extract(OpusRangeCoder *rc, unsigned int ptotal)
+{
+    unsigned int k, scale, psymbol, plow, phigh;
+    scale = rc->range / ptotal;
+    psymbol = rc->value / scale;
+    k = ptotal - FFMIN(psymbol+1, ptotal);
+
+    plow = k;
+    phigh = k+1;
+
+    rc->value -= scale * (ptotal - phigh);
+    rc->range  = plow ? scale * (phigh - plow)
+                      : rc->range - scale * (ptotal - phigh);
+
+    opus_rc_normalize(rc);
+
+    return k;
+}
+
+/**
+ * CELT: read raw bits at the end of the Opus frame, backwards byte-wise
+ *
+ * The spec says that it is impossible to read more raw bits
+ * than there are actual bits in the frame, so we do not do bounds checking.
+ */
+static unsigned int opus_getrawbits(OpusRangeCoder *rc, unsigned int count)
+{
+    unsigned int value = 0, bit = 0;
+
+    while (count) {
+        if (count <= rc->rb.cache) {
+            value |= (rc->rb.byte & ((1<<count)-1)) << bit;
+            bit += count;
+            rc->rb.cache -= count;
+            rc->rb.byte >>= count;
+        } else {
+            value |= rc->rb.byte << bit;
+            bit += rc->rb.cache;
+            rc->rb.cache = 0;
+        }
+
+        if (rc->rb.cache == 0) {
+            rc->rb.position--;
+            rc->rb.cache = 8;
+            rc->rb.byte = rc->rb.position[0];
+        }
+    }
+
+    return value;
+}
+
+/**
+ * CELT: read a uniform distribution
+ */
+static unsigned int opus_rc_getsymbol_uni(OpusRangeCoder *rc, unsigned int size){
+    unsigned int bits, k, ptotal;
+
+    bits = ilog(size-1);
+    if (bits > 8) {
+        /* combine with raw bits */
+        size--;
+        bits -= 8;
+        ptotal = (size>>bits) + 1;
+        k = opus_rc_extract(rc, ptotal);
+        k = k << bits | opus_getrawbits(rc, bits);
+        return FFMIN(k, size);
+    } else
+        return opus_rc_extract(rc, size);
 }
 
 /**
@@ -622,18 +711,19 @@ static void silk_lsf2lpc(const int16_t nlsf[16], int16_t lpc[16], int order)
 }
 
 static inline void silk_decode_lpc(OpusContext *s, int16_t lpc_leadin[16], int16_t lpc[16],
-                                   int *has_lpc_leadin, int voiced, int channel)
+                                   int *lpc_order, int *has_lpc_leadin, int voiced, int channel)
 {
     int i;
-    int order;                         // order of the LP polynomial; 10 for NB/MB and 16 for WB
-    int8_t  lsf_i1, lsf_i2[16];        // stage-1 and stage-2 codebook indices
-    int16_t lsf_res[16];               // residual as a Q10 value
-    int16_t nlsf_leadin[16], nlsf[16]; // Q15
-    
+    int order;                   // order of the LP polynomial; 10 for NB/MB and 16 for WB
+    int8_t  lsf_i1, lsf_i2[16];  // stage-1 and stage-2 codebook indices
+    int16_t lsf_res[16];         // residual as a Q10 value
+    int16_t nlsf[16];            // Q15
+
+    *lpc_order = order = (s->packet.bandwidth != OPUS_BANDWIDTH_WIDEBAND) ? 10 : 16;
+
     /* obtain LSF stage-1 and stage-2 indices */
     lsf_i1 = opus_rc_getsymbol(&s->rc, silk_model_lsf_s1[s->packet.bandwidth ==
                                        OPUS_BANDWIDTH_WIDEBAND][voiced]);
-    order = (s->packet.bandwidth != OPUS_BANDWIDTH_WIDEBAND) ? 10 : 16;
     for (i = 0; i < order; i++) {
         int index = (s->packet.bandwidth != OPUS_BANDWIDTH_WIDEBAND)
                     ? silk_lsf_s2_model_sel_nbmb[lsf_i1][i]
@@ -688,50 +778,152 @@ static inline void silk_decode_lpc(OpusContext *s, int16_t lpc_leadin[16], int16
     silk_stabilize_lsf(nlsf, order, (s->packet.bandwidth != OPUS_BANDWIDTH_WIDEBAND)
                                     ? silk_lsf_min_spacing_nbmb : silk_lsf_min_spacing_wb);
 
-    /* produce an interpolation for the first 2 subframes */
+    /* produce an interpolation for the first 2 subframes, */
+    /* and then convert both sets of NLSFs to LPC coefficients */
     *has_lpc_leadin = 0;
     if (s->silk.subframes == 4) {
         int offset = opus_rc_getsymbol(&s->rc, silk_model_lsf_interpolation_offset);
         if (offset != 4 && s->silk.prevframe[channel].coded) {
             *has_lpc_leadin = 1;
-            for (i = 0; i < order; i++)
-                nlsf_leadin[i] = s->silk.prevframe[channel].nlsf[i] +
-                                 ((nlsf[i] - s->silk.prevframe[channel].nlsf[i])*offset >> 2);
+            if (offset != 0) {
+                int16_t nlsf_leadin[16];
+                for (i = 0; i < order; i++)
+                    nlsf_leadin[i] = s->silk.prevframe[channel].nlsf[i] +
+                        ((nlsf[i] - s->silk.prevframe[channel].nlsf[i]) * offset >> 2);
+                silk_lsf2lpc(nlsf_leadin, lpc_leadin, order);
+            } else  /* avoid re-computation for a (roughly) 1-in-4 occurrence */
+                memcpy(lpc_leadin, s->silk.prevframe[channel].lpc, sizeof(lpc_leadin));
+        }
+
+        silk_lsf2lpc(nlsf, lpc, order);
+        memcpy(s->silk.prevframe[channel].nlsf, nlsf, sizeof(nlsf));
+        memcpy(s->silk.prevframe[channel].lpc, lpc, sizeof(lpc));
+    } else
+        silk_lsf2lpc(nlsf, lpc, order);
+}
+
+static inline void silk_count_children(OpusRangeCoder *rc, int model, int32_t total,
+                                       int32_t child[2])
+{
+    if (total != 0) {
+        child[0] = opus_rc_getsymbol(rc,
+                       silk_model_pulse_location[model] + (((total-1 + 5) * (total-1)) >> 1));
+        child[1] = total - child[0];
+    } else {
+        child[0] = 0;
+        child[1] = 0;
+    }
+}
+
+static inline void silk_decode_excitation(OpusContext *s, float excitationf[320],
+                                          int qoffset_high, int active, int voiced)
+{
+    int i;
+    int32_t seed;
+    int shellblocks;
+    int ratelevel;
+    uint8_t pulsecount[20];     // total pulses in each shell block
+    uint8_t lsbcount[20] = {0}; // raw lsbits defined for each pulse in each shell block
+    int32_t excitation[320];    // Q23
+
+    /* excitation parameters */
+    seed = opus_rc_getsymbol(&s->rc, silk_model_lcg_seed);
+    shellblocks = silk_shell_blocks[s->packet.bandwidth][s->silk.subframes >> 2];
+    ratelevel = opus_rc_getsymbol(&s->rc, silk_model_exc_rate[voiced]);
+
+    for (i = 0; i < shellblocks; i++) {
+        pulsecount[i] = opus_rc_getsymbol(&s->rc, silk_model_pulse_count[ratelevel]);
+        if (pulsecount[i] == 17) {
+            while (pulsecount[i] == 17 && ++lsbcount[i] != 10)
+                pulsecount[i] = opus_rc_getsymbol(&s->rc, silk_model_pulse_count[9]);
+            if (lsbcount[i] == 10)
+                pulsecount[i] = opus_rc_getsymbol(&s->rc, silk_model_pulse_count[10]);
         }
     }
-    memcpy(s->silk.prevframe[channel].nlsf, nlsf, sizeof(nlsf));
 
-    /* convert both sets of NLSFs to LPC coefficients */
-    if (*has_lpc_leadin)
-        silk_lsf2lpc(nlsf_leadin, lpc_leadin, order);
-    silk_lsf2lpc(nlsf, lpc, order);
+    /* decode pulse locations using PVQ */
+    for (i = 0; i < shellblocks; i++) {
+        if (pulsecount[i] != 0) {
+            int a, b, c, d;
+            int32_t * location = excitation + 16*i;
+            int32_t branch[4][2];
+            branch[0][0] = pulsecount[i];
+
+            /* unrolled tail recursion */
+            for (a = 0; a < 1; a++) {
+                silk_count_children(&s->rc, 0, branch[0][a], branch[1]);
+                for (b = 0; b < 2; b++) {
+                    silk_count_children(&s->rc, 1, branch[1][b], branch[2]);
+                    for (c = 0; c < 2; c++) {
+                        silk_count_children(&s->rc, 2, branch[2][c], branch[3]);
+                        for (d = 0; d < 2; d++) {
+                            silk_count_children(&s->rc, 3, branch[3][d], location);
+                            location += 2;
+                        }
+                    }
+                }
+            }
+        } else
+            memset(excitation + 16*i, 0, 16*sizeof(int32_t));
+    }
+
+    /* decode least significant bits */
+    for (i = 0; i < shellblocks << 4; i++) {
+        int bit;
+        for (bit = 0; bit < lsbcount[i >> 4]; bit++)
+            excitation[i] = (excitation[i] << 1) |
+                            opus_rc_getsymbol(&s->rc, silk_model_excitation_lsb);
+    }
+
+    /* decode signs */
+    for (i = 0; i < shellblocks << 4; i++) {
+        if (excitation[i] != 0) {
+            int sign = opus_rc_getsymbol(&s->rc, silk_model_excitation_sign[active+
+                                         voiced][qoffset_high][FFMIN(pulsecount[i >> 4], 6)]);
+            if (sign == 0)
+                excitation[i] *= -1;
+        }
+    }
+
+    /* assemble the excitation */
+    for (i = 0; i < shellblocks << 4; i++) {
+        int value = excitation[i];
+        excitation[i] = (value << 8) | silk_quant_offset[voiced][qoffset_high];
+        if (value < 0)      excitation[i] += 20;
+        else if (value > 0) excitation[i] -= 20;
+
+        /* invert samples pseudorandomly */
+        seed = 196314165*seed + 907633515;
+        if (seed < 0)
+            excitation[i] *= -1;
+        seed += value;
+
+        excitationf[i] = (float)excitation[i] / 8388608.0f;
+    }
 }
 
 static inline int silk_decode_frame(OpusContext *s, int frame, int channel, int active)
 {
-    int i, j;
+    int i, idx;
 
     /* per frame */
     int voiced;       // combines with active to indicate inactive, active, or active+voiced
     int qoffset_high;
-    int16_t lpc_leadin[16], lpc[16]; // Q12
+    int order;
+    int16_t lpc_leadin[16], lpc_body[16]; // Q12
     int has_lpc_leadin;
-    int ltpfilter;
-    int ltpscale;
-    int seed;
-    int shellblocks;
-    int ratelevel;
-    uint8_t pulsecount[20];      // per shell block
-    uint8_t lsbcount[20] = {0};  // LSB count per coefficient per shell block
-    uint8_t pulses[20][8] = {{0}}; // physical count of pulses in each shell block
+    float lpc[16];
+    float ltpscale;
+    float excitation[320];
+    float sLTP[640] = {0};
 
     /* per subframe */
     struct {
-        int gain_index;
+        float gain;
         int pitchlag;
-        const int8_t *ltp;
+        float ltptaps[5];
     } sf[4];
-    
+
     SilkFrame * const prevframe = s->silk.prevframe + channel;
 
     /* obtain stereo weights */
@@ -766,34 +958,52 @@ static inline int silk_decode_frame(OpusContext *s, int frame, int channel, int 
 
     /* obtain subframe quantization gains */
     for (i = 0; i < s->silk.subframes; i++) {
+        int log_gain;     //Q7
+        int ipart, fpart, lingain;
+
         if (i == 0 && (frame == 0 || !prevframe->coded)) {
-            /* gain index is coded absolute */
+            /* gain is coded absolute */
             int x = opus_rc_getsymbol(&s->rc, silk_model_gain_highbits[active + voiced]);
-            sf[i].gain_index = (x<<3) | opus_rc_getsymbol(&s->rc, silk_model_gain_lowbits);
+            log_gain = (x<<3) | opus_rc_getsymbol(&s->rc, silk_model_gain_lowbits);
+
+            if (prevframe->coded)
+                log_gain = FFMAX(log_gain, prevframe->log_gain - 16);
         } else {
-            /* gain index is coded relative */
-            sf[i].gain_index = opus_rc_getsymbol(&s->rc, silk_model_gain_delta);
+            /* gain is coded relative */
+            int delta_gain = opus_rc_getsymbol(&s->rc, silk_model_gain_delta);
+            log_gain = av_clip(FFMAX((delta_gain<<1) - 16,
+                                     prevframe->log_gain + delta_gain - 4), 0, 63);
         }
+
+        prevframe->log_gain = log_gain;
+
+        /* approximate 2**(x/128) with a Q7 (i.e. non-integer) input */
+        log_gain = (log_gain * 0x1D1C71 >> 16) + 2090;
+        ipart = log_gain >> 7;
+        fpart = log_gain & 127;
+        lingain = (1<<ipart) + ((-174 * fpart * (128-fpart) >>16) + fpart) * ((1<<ipart) >> 7);
+        sf[i].gain = (float)lingain / 65536.0f;
     }
-    
+
     /* obtain LPC filter coefficients */
-    silk_decode_lpc(s, lpc_leadin, lpc, &has_lpc_leadin, voiced, channel);
-    
+    silk_decode_lpc(s, lpc_leadin, lpc_body, &order, &has_lpc_leadin, voiced, channel);
+
     /* obtain pitch lags, if this is a voiced frame */
     if (voiced) {
-        int primarylag;        // primary pitch lag for the entire SILK frame
+        int primarylag;         // primary pitch lag for the entire SILK frame
+        int ltpfilter;
         const int8_t * offsets;
-        
+
         if (frame == 0 || !prevframe->coded || !prevframe->voiced) {
             /* primary lag is coded absolute */
             int highbits, lowbits;
             const uint16_t *model[] = {
-                silk_model_pitch_lowbits_nb, silk_model_pitch_lowbits_mb, 
+                silk_model_pitch_lowbits_nb, silk_model_pitch_lowbits_mb,
                 silk_model_pitch_lowbits_wb
             };
             highbits = opus_rc_getsymbol(&s->rc, silk_model_pitch_highbits);
             lowbits  = opus_rc_getsymbol(&s->rc, model[s->packet.bandwidth]);
-            
+
             primarylag = silk_pitch_min_lag[s->packet.bandwidth] +
                          highbits*silk_pitch_scale[s->packet.bandwidth] + lowbits;
         } else {
@@ -802,7 +1012,7 @@ static inline int silk_decode_frame(OpusContext *s, int frame, int channel, int 
                          opus_rc_getsymbol(&s->rc, silk_model_pitch_delta) - 9;
         }
         prevframe->primarylag = primarylag;
-        
+
         if (s->silk.subframes == 2)
             offsets = (s->packet.bandwidth == OPUS_BANDWIDTH_NARROWBAND)
                      ? silk_pitch_offset_nb10ms[opus_rc_getsymbol(&s->rc,
@@ -815,61 +1025,101 @@ static inline int silk_decode_frame(OpusContext *s, int frame, int channel, int 
                                                 silk_model_pitch_contour_nb20ms)]
                      : silk_pitch_offset_mbwb20ms[opus_rc_getsymbol(&s->rc,
                                                 silk_model_pitch_contour_mbwb20ms)];
-        
+
         for (i = 0; i < s->silk.subframes; i++)
             sf[i].pitchlag = av_clip(primarylag + offsets[i],
                                      silk_pitch_min_lag[s->packet.bandwidth],
                                      silk_pitch_max_lag[s->packet.bandwidth]);
-    }
-    
-    /* obtain LTP filter coefficients */
-    ltpfilter = opus_rc_getsymbol(&s->rc, silk_model_ltp_filter);
-    for (i = 0; i < s->silk.subframes; i++) {
-        int index;
-        const uint16_t *filter_sel[] = {
-            silk_model_ltp_filter0_sel, silk_model_ltp_filter1_sel, silk_model_ltp_filter2_sel
-        };
-        const int8_t (*filter_taps[])[5] = {
-            silk_ltp_filter0_taps, silk_ltp_filter1_taps, silk_ltp_filter2_taps
-        };
-        index = opus_rc_getsymbol(&s->rc, filter_sel[ltpfilter]);
-        sf[i].ltp = filter_taps[ltpfilter][index];
-    }
-    
-    /* obtain LTP scale factor */
-    if (voiced && frame == 0)
-        ltpscale = silk_ltp_scale_factor[opus_rc_getsymbol(&s->rc, silk_model_ltp_scale_index)];
-    else ltpscale = 15565;
-    
-    /* obtain PRNG seed */
-    seed = opus_rc_getsymbol(&s->rc, silk_model_lcg_seed);
-    
-    /* obtain excitation parameters */
-    shellblocks = silk_shell_blocks[s->packet.bandwidth][s->silk.subframes >> 2];
-    ratelevel = opus_rc_getsymbol(&s->rc, silk_model_exc_rate[voiced]);
-    
-    for (i = 0; i < shellblocks; i++) {
-        pulsecount[i] = opus_rc_getsymbol(&s->rc, silk_model_pulse_count[ratelevel]);
-        if (pulsecount[i] == 17) {
-            lsbcount[i]++;
-            for (j = 0; j < 10; j++) {
-                pulsecount[i] = opus_rc_getsymbol(&s->rc, silk_model_pulse_count[9]);
-                if (pulsecount[i] == 17)
-                    lsbcount[i]++;
-                else break;
-            }
-            if (j == 10)
-                pulsecount[i] = opus_rc_getsymbol(&s->rc, silk_model_pulse_count[10]);
+
+        /* obtain LTP filter coefficients */
+        ltpfilter = opus_rc_getsymbol(&s->rc, silk_model_ltp_filter);
+        for (i = 0; i < s->silk.subframes; i++) {
+            int index, j;
+            const uint16_t *filter_sel[] = {
+                silk_model_ltp_filter0_sel, silk_model_ltp_filter1_sel,
+                silk_model_ltp_filter2_sel
+            };
+            const int8_t (*filter_taps[])[5] = {
+                silk_ltp_filter0_taps, silk_ltp_filter1_taps, silk_ltp_filter2_taps
+            };
+            index = opus_rc_getsymbol(&s->rc, filter_sel[ltpfilter]);
+            for (j = 0; j < 5; j++)
+                sf[i].ltptaps[j] = (float)filter_taps[ltpfilter][index][j] / 128.0f;
         }
     }
-    
-    /* for (i = 0; i < shellblocks; i++) {
-        decode_split(s, &pulses3[0], &pulses3[1], pulses4, silk_shell_code_table3);
-    } */
-    
-    /* for (i = 0; i < shellblocks; i++) {
-        silk_model_excitation_lsb
-    } */
+
+    /* obtain LTP scale factor */
+    if (voiced && frame == 0)
+        ltpscale = silk_ltp_scale_factor[opus_rc_getsymbol(&s->rc,
+                                         silk_model_ltp_scale_index)] / 16384.0f;
+    else ltpscale = (float)15565/16384.0f;
+
+    /* generate the excitation signal for the entire frame */
+    silk_decode_excitation(s, excitation, qoffset_high, active, voiced);
+
+    for (i = 0; i < s->silk.flength; i++)
+        av_dlog(NULL, "excitation[%d] = %f\n", i, excitation[i]);
+
+    /* generate the output signal */
+    for (i = 0, idx = s->silk.flength; i < s->silk.subframes; i++, idx += s->silk.sflength) {
+        int j, k;
+
+        if (i == 0 || (i == 2 && has_lpc_leadin)) {
+            const int16_t * lpcin = (i == 0) ? lpc_leadin : lpc_body;
+
+            /* convert the LPC coefficients to floating point */
+            for (k = 0; k < order; k++)
+                lpc[k] = (float)lpcin[k] / 4096.0f;
+
+            if (voiced) {
+                /* since the LPC coefficients likely changed, */
+                /* run the output history through a rewhiten filter */
+                int buffer_length = sf[i].pitchlag + order + 2;
+
+                for (j = idx - buffer_length; j < s->silk.flength; j++) {
+                    sLTP[j] = prevframe->output[j];
+                    for (k = 1; k <= order; k++)
+                        sLTP[j] -= lpc[k-1] * prevframe->output[j-k];
+                }
+                for (j = idx - buffer_length; j < s->silk.flength; j++)
+                    sLTP[j] = av_clipf(sLTP[j], -1.0, 1.0) * ltpscale / sf[i].gain;
+            }
+        }
+
+        if (voiced) {
+            /* LTP synthesis */
+            for (j = 0; j < 5; j++)
+                av_dlog(NULL, "ltptaps[%d] = %f\n", i, sf[i].ltptaps[j]);
+            //getchar();
+
+            for (j = idx; j < idx + s->silk.sflength; j++) {
+                sLTP[j] = excitation[j - s->silk.flength];
+                for (k = 0; k < 5; k++)
+                    sLTP[j] += sf[i].ltptaps[k] * sLTP[j - sf[i].pitchlag + 2 - k];
+            }
+        } else
+            memcpy(sLTP + idx, excitation + idx - s->silk.flength,
+                   s->silk.sflength * sizeof(float));
+
+        for (j = idx; j < idx + s->silk.sflength; j++)
+            sLTP[j] *= sf[i].gain;
+
+        for (j = idx; j < idx + s->silk.sflength; j++)
+            av_dlog(NULL, "sLTP[%d] = %f\n", j, sLTP[j]);
+        //getchar();
+
+        /* LPC synthesis */
+        for (j = idx; j < idx + s->silk.sflength; j++) {
+            for (k = 1; k <= order; k++)
+                sLTP[j] += lpc[k-1] * sLTP[j-k];
+        }
+
+        for (j = idx; j < idx + s->silk.sflength; j++)
+            av_dlog(NULL, "sLTP[%d] = %f\n", j, sLTP[j]);
+        //getchar();
+    }
+
+    memcpy(prevframe->output, sLTP + s->silk.flength, s->silk.flength * sizeof(float));
 
     return 0;
 }
@@ -878,8 +1128,50 @@ static inline int silk_decode_frame(OpusContext *s, int frame, int channel, int 
  * CELT decoder
  */
 
-static int celt_decode_frame(OpusContext *s)
+static int celt_decode_frame(OpusContext *s, int hybrid)
 {
+    int silence;
+    int has_postfilter;
+    int pf_octave;
+    int pf_period;
+    int pf_gain;
+    int pf_tapset;
+    int transient;
+    int intra;
+    int coarseenergy;
+    int tfchange;
+    int tfselect;
+    int spread;
+    int dynalloc;
+    int alloctrim;
+    int skip;
+    int intensity;
+    int dual;
+    int fineenergy;
+    int residual;
+    int anticollapse;
+    int finalize;
+
+    silence = opus_rc_getsymbol(&s->rc, celt_model_silence);
+    has_postfilter = opus_rc_getsymbol(&s->rc, rc_model_bit);
+
+    if (has_postfilter) {
+        pf_octave = opus_rc_getsymbol_uni(&s->rc, 6);
+        pf_period = opus_getrawbits(&s->rc, 4+pf_octave);
+        pf_gain = opus_getrawbits(&s->rc, 3);
+        pf_tapset = opus_rc_getsymbol(&s->rc, celt_model_tapset);
+    }
+
+    transient = opus_rc_getsymbol(&s->rc, celt_model_transient_intra);
+    intra = opus_rc_getsymbol(&s->rc, celt_model_transient_intra);
+
+    /* ... */
+
+    spread = opus_rc_getsymbol(&s->rc, celt_model_spread);
+
+    /* ... */
+
+    alloctrim = opus_rc_getsymbol(&s->rc, celt_model_alloc_trim);
     return 0;
 }
 
@@ -896,7 +1188,8 @@ static av_cold int opus_decode_init(AVCodecContext *avctx)
     s->avctx = avctx;
     s->rc.gb = &s->gb;
 
-    avctx->sample_fmt = AV_SAMPLE_FMT_S16;
+    avctx->sample_fmt = AV_SAMPLE_FMT_FLT;
+    avctx->channels = 1;
 
     avcodec_get_frame_defaults(&s->frame);
     avctx->coded_frame = &s->frame;
@@ -914,7 +1207,7 @@ static int opus_decode_frame(AVCodecContext *avctx, void *data,
                              int *got_frame_ptr, AVPacket *avpkt)
 {
     int header = 0;
-    int ret;
+    int i, j, ret;
     OpusContext *s = avctx->priv_data;
     s->buf = avpkt->data;
 
@@ -924,7 +1217,7 @@ static int opus_decode_frame(AVCodecContext *avctx, void *data,
     /* if this is a new packet, parse its header */
     if (s->currentframe == s->packet.frame_count) {
         s->buf_size = avpkt->size;
-        if ((header = opus_parse_packet(s)) < 0) {
+        if ((header = opus_parse_packet(s, 0)) < 0) {
             av_log(avctx, AV_LOG_ERROR, "Error parsing packet\n");
             return header;
         }
@@ -948,12 +1241,14 @@ static int opus_decode_frame(AVCodecContext *avctx, void *data,
 
     if (s->packet.mode == OPUS_MODE_SILK || s->packet.mode == OPUS_MODE_HYBRID) {
         /* Decode 1-3 SILK frames */
-        int i, j, ret, silkframes;
+        int silkframes;
         int active[2][6], redundancy[2];
 
         silkframes        = 1 + (s->packet.frame_duration >= 1920)
                               + (s->packet.frame_duration == 2880);
         s->silk.subframes = (s->packet.frame_duration == 480) ? 2 : 4; // per whole SILK frame
+        s->silk.sflength  = 20 * (s->packet.bandwidth + 2);
+        s->silk.flength   = s->silk.sflength * ((s->packet.frame_duration == 480) ? 2 : 4);
 
         /* read the LP-layer header bits */
         for (i = 0; i <= s->packet.stereo; i++) {
@@ -968,15 +1263,19 @@ static int opus_decode_frame(AVCodecContext *avctx, void *data,
         }
 
         for (i = 0; i < silkframes; i++) {
+            float * data = (float*) s->frame.data[0];
             for (j = 0; j <= s->packet.stereo; j++) {
                 if ((ret = silk_decode_frame(s, i, j, active[j][i])) < 0) {
                     av_log(avctx, AV_LOG_ERROR, "Error reading SILK frame\n");
                     return ret;
                 }
-                
-                s->silk.prevframe[0].coded = 1;
-                s->silk.prevframe[1].coded = s->packet.stereo;
             }
+
+            for (j = i * s->silk.flength; j < (i + 1) * s->silk.flength; j++)
+                data[j] = av_clipf(s->silk.prevframe[0].output[j], -1.0, 1.0);
+
+            s->silk.prevframe[0].coded = 1;
+            s->silk.prevframe[1].coded = s->packet.stereo;
         }
     } else {
         s->silk.prevframe[0].coded = 0;
@@ -984,15 +1283,12 @@ static int opus_decode_frame(AVCodecContext *avctx, void *data,
     }
 
     if (s->packet.mode == OPUS_MODE_CELT || s->packet.mode == OPUS_MODE_HYBRID) {
-        /* decode a CELT frame */
-        av_log(avctx, AV_LOG_ERROR, "CELT frame in input\n");
-        celt_decode_frame(s);
+        /* Decode a CELT frame */
+        celt_decode_frame(s, s->packet.mode == OPUS_MODE_HYBRID);
 
         s->celt.prevframe[0].coded = 1;
-        s->celt.prevframe[1].coded = 1;
     } else {
         s->celt.prevframe[0].coded = 0;
-        s->celt.prevframe[1].coded = 0;
     }
 
     *got_frame_ptr   = 1;
@@ -1009,6 +1305,11 @@ static int opus_decode_frame(AVCodecContext *avctx, void *data,
     return avpkt->size;
 }
 
+static av_cold void opus_decode_flush(AVCodecContext *ctx)
+{
+    OpusContext *s = ctx->priv_data;
+}
+
 AVCodec ff_opus_decoder = {
     .name            = "opus",
     .type            = AVMEDIA_TYPE_AUDIO,
@@ -1018,5 +1319,6 @@ AVCodec ff_opus_decoder = {
     .close           = opus_decode_close,
     .decode          = opus_decode_frame,
     .capabilities    = CODEC_CAP_DR1 | CODEC_CAP_SUBFRAMES,
+    .flush           = opus_decode_flush,
     .long_name       = NULL_IF_CONFIG_SMALL("Opus"),
 };

@@ -1,6 +1,6 @@
 /*
  * Opus parser for Ogg
- * Copyright (c) 2011 Justin Ruggles
+ * Copyright (c) 2012 Andrew D'Addesio
  *
  * This file is part of Libav.
  *
@@ -68,11 +68,7 @@ static int opus_header(AVFormatContext *s, int idx)
             av_log(s, AV_LOG_ERROR, "OpusHead header packet is too small\n");
             return AVERROR_INVALIDDATA;
         }
-        if (memcmp(p, "OpusHead", 8)) {
-            av_log(s, AV_LOG_ERROR, "first packet must be an id header\n");
-            return AVERROR_INVALIDDATA;
-        }
-        if (AV_RL8(p + 8) != 1) {
+        if (AV_RL8(p + 8) > 15) {
             av_log(s, AV_LOG_ERROR, "unrecognized OggOpus version\n");
             return AVERROR_INVALIDDATA;
         }
@@ -123,7 +119,7 @@ static int opus_header(AVFormatContext *s, int idx)
     return 1;
 }
 
-static int opus_packet_duration(AVFormatContext *s, const uint8_t *buf, int buf_size)
+static inline int opus_packet_duration(AVFormatContext *s, const uint8_t *buf, int buf_size)
 {
     int i, code, config, duration, frame_count;
 
@@ -132,7 +128,7 @@ static int opus_packet_duration(AVFormatContext *s, const uint8_t *buf, int buf_
         code   = (i     ) & 0x3;
         config = (i >> 3) & 0x1F;
 
-        if (!code || buf_size >= 2) {
+        if (code == 0 || buf_size >= 2) {
             duration = opus_frame_duration[config];
             frame_count = (code == 0) ? 1 : (code <= 2) ? 2 : (*buf & 0x3F);
 

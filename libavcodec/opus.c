@@ -43,7 +43,10 @@
 
 #define MAX_FRAME_SIZE 1275
 #define MAX_FRAMES     48
-#define MAX_FRAME_DUR  5760 /* in samples @ 48kHz */
+#define MAX_FRAME_DUR  5760
+
+#define SILK_HISTORY   306
+#define SILK_MAX_LPC   16
 
 #define ROUND_MULL(a,b,s) (((MUL64(a, b) >> (s - 1)) + 1) >> 1)
 #define ilog(i) av_log2((i)<<1)
@@ -110,7 +113,8 @@ typedef struct {
     int log_gain;
     int16_t nlsf[16];
     int16_t lpc[16];
-    float output[320];
+    float output[SILK_HISTORY];
+    float lpc_history[16];
     int primarylag;
 } SilkFrame;
 
@@ -144,8 +148,6 @@ typedef struct {
     int currentframe;
     uint8_t *buf;
     int buf_size;
-
-    float output[2*MAX_FRAME_DUR];  /** stereo samples @ 48kHz */
 } OpusContext;
 
 static inline void opus_dprint_packet(AVCodecContext *avctx, OpusPacket *pkt)
@@ -427,9 +429,9 @@ static unsigned int opus_rc_extract(OpusRangeCoder *rc, unsigned int ptotal)
 }
 
 /**
- * CELT: read raw bits at the end of the Opus frame, backwards byte-wise
+ * CELT: read raw bits at the end of the frame, backwards byte-wise
  *
- * The spec says that it is impossible to read more raw bits
+ * The spec says that it is impossible to attempt to read more raw bits
  * than there are actual bits in the frame, so we do not do bounds checking.
  */
 static unsigned int opus_getrawbits(OpusRangeCoder *rc, unsigned int count)
@@ -792,12 +794,14 @@ static inline void silk_decode_lpc(OpusContext *s, int16_t lpc_leadin[16], int16
                         ((nlsf[i] - s->silk.prevframe[channel].nlsf[i]) * offset >> 2);
                 silk_lsf2lpc(nlsf_leadin, lpc_leadin, order);
             } else  /* avoid re-computation for a (roughly) 1-in-4 occurrence */
-                memcpy(lpc_leadin, s->silk.prevframe[channel].lpc, sizeof(lpc_leadin));
+                memcpy(lpc_leadin, s->silk.prevframe[channel].lpc, 16*sizeof(int16_t));
         }
 
         silk_lsf2lpc(nlsf, lpc, order);
-        memcpy(s->silk.prevframe[channel].nlsf, nlsf, sizeof(nlsf));
-        memcpy(s->silk.prevframe[channel].lpc, lpc, sizeof(lpc));
+        if(*has_lpc_leadin && !memcmp(lpc, lpc_leadin, order*sizeof(int16_t)))
+            *has_lpc_leadin = 0;
+        memcpy(s->silk.prevframe[channel].nlsf, nlsf, 16*sizeof(int16_t));
+        memcpy(s->silk.prevframe[channel].lpc, lpc, 16*sizeof(int16_t));
     } else
         silk_lsf2lpc(nlsf, lpc, order);
 }
@@ -814,6 +818,8 @@ static inline void silk_count_children(OpusRangeCoder *rc, int model, int32_t to
         child[1] = 0;
     }
 }
+
+static int silk_frame = 0;
 
 static inline void silk_decode_excitation(OpusContext *s, float excitationf[320],
                                           int qoffset_high, int active, int voiced)
@@ -909,13 +915,14 @@ static inline int silk_decode_frame(OpusContext *s, int frame, int channel, int 
     /* per frame */
     int voiced;       // combines with active to indicate inactive, active, or active+voiced
     int qoffset_high;
-    int order;
-    int16_t lpc_leadin[16], lpc_body[16]; // Q12
+    int order;                             // order of the LPC coefficients
+    int16_t lpc_leadin[16], lpc_body[16];  // Q12
     int has_lpc_leadin;
     float lpc[16];
     float ltpscale;
     float excitation[320];
-    float sLTP[640] = {0};
+    float residual[SILK_HISTORY+320];
+    float output[SILK_MAX_LPC+320];
 
     /* per subframe */
     struct {
@@ -1052,74 +1059,78 @@ static inline int silk_decode_frame(OpusContext *s, int frame, int channel, int 
     if (voiced && frame == 0)
         ltpscale = silk_ltp_scale_factor[opus_rc_getsymbol(&s->rc,
                                          silk_model_ltp_scale_index)] / 16384.0f;
-    else ltpscale = (float)15565/16384.0f;
+    else ltpscale = 15565.0f/16384.0f;
 
     /* generate the excitation signal for the entire frame */
     silk_decode_excitation(s, excitation, qoffset_high, active, voiced);
 
-    for (i = 0; i < s->silk.flength; i++)
-        av_dlog(NULL, "excitation[%d] = %f\n", i, excitation[i]);
+    memcpy(output, prevframe->lpc_history, SILK_MAX_LPC * sizeof(float));
 
     /* generate the output signal */
-    for (i = 0, idx = s->silk.flength; i < s->silk.subframes; i++, idx += s->silk.sflength) {
+    for (i = 0, idx = 0; i < s->silk.subframes; i++, idx += s->silk.sflength) {
         int j, k;
+        float * resptr = (voiced) ? residual + SILK_HISTORY : excitation;
+        float * outptr = output + SILK_MAX_LPC;
 
         if (i == 0 || (i == 2 && has_lpc_leadin)) {
-            const int16_t * lpcin = (i == 0) ? lpc_leadin : lpc_body;
+            const int16_t * lpcin = (i == 0 && has_lpc_leadin) ? lpc_leadin : lpc_body;
 
             /* convert the LPC coefficients to floating point */
             for (k = 0; k < order; k++)
                 lpc[k] = (float)lpcin[k] / 4096.0f;
 
-            if (voiced) {
-                /* since the LPC coefficients likely changed, */
-                /* run the output history through a rewhiten filter */
-                int buffer_length = sf[i].pitchlag + order + 2;
+            /* since the LPC coefficients changed, a re-whitening filter is used */
+            /* to produce a residual that accounts for the change */
 
-                for (j = idx - buffer_length; j < s->silk.flength; j++) {
-                    sLTP[j] = prevframe->output[j];
+            if (voiced) {
+                for (j = idx - sf[i].pitchlag - 2; j < idx; j++) {
+                    resptr[j] = prevframe->output[s->silk.flength+j];
                     for (k = 1; k <= order; k++)
-                        sLTP[j] -= lpc[k-1] * prevframe->output[j-k];
+                        resptr[j] -= lpc[k-1] * prevframe->output[s->silk.flength+j-k];
+                    resptr[j] = av_clipf(resptr[j], -1.0, 1.0) * ((i==0)?ltpscale:1.0f) / sf[i].gain;
                 }
-                for (j = idx - buffer_length; j < s->silk.flength; j++)
-                    sLTP[j] = av_clipf(sLTP[j], -1.0, 1.0) * ltpscale / sf[i].gain;
+            }
+        } else if (i != 2 && voiced) {
+            /* re-whitening filter */
+            for (j = idx - s->silk.sflength; j < idx; j++) {
+                resptr[j] = outptr[j];
+                for (k = 1; k <= order; k++)
+                    resptr[j] -= lpc[k-1] * outptr[j-k];
+                resptr[j] /= sf[i].gain;
             }
         }
 
         if (voiced) {
             /* LTP synthesis */
-            for (j = 0; j < 5; j++)
-                av_dlog(NULL, "ltptaps[%d] = %f\n", i, sf[i].ltptaps[j]);
-            //getchar();
-
             for (j = idx; j < idx + s->silk.sflength; j++) {
-                sLTP[j] = excitation[j - s->silk.flength];
+                resptr[j] = excitation[j];
                 for (k = 0; k < 5; k++)
-                    sLTP[j] += sf[i].ltptaps[k] * sLTP[j - sf[i].pitchlag + 2 - k];
+                    resptr[j] += sf[i].ltptaps[k] * resptr[j - sf[i].pitchlag + 2 - k];
             }
-        } else
-            memcpy(sLTP + idx, excitation + idx - s->silk.flength,
-                   s->silk.sflength * sizeof(float));
+        }
 
         for (j = idx; j < idx + s->silk.sflength; j++)
-            sLTP[j] *= sf[i].gain;
-
-        for (j = idx; j < idx + s->silk.sflength; j++)
-            av_dlog(NULL, "sLTP[%d] = %f\n", j, sLTP[j]);
+            av_dlog(NULL, "resptr[%d] = %f\n", j, resptr[j]);
         //getchar();
 
         /* LPC synthesis */
         for (j = idx; j < idx + s->silk.sflength; j++) {
+            outptr[j] = resptr[j] * sf[i].gain;
             for (k = 1; k <= order; k++)
-                sLTP[j] += lpc[k-1] * sLTP[j-k];
+                outptr[j] += lpc[k-1] * outptr[j-k];
         }
 
         for (j = idx; j < idx + s->silk.sflength; j++)
-            av_dlog(NULL, "sLTP[%d] = %f\n", j, sLTP[j]);
+            av_dlog(NULL, "outptr[%d] = %f\n", j, outptr[j]);
         //getchar();
+
+        for (j = idx; j < idx + s->silk.sflength; j++)
+            prevframe->output[j] = av_clipf(outptr[j], -1.0, 1.0);
     }
 
-    memcpy(prevframe->output, sLTP + s->silk.flength, s->silk.flength * sizeof(float));
+    memcpy(prevframe->lpc_history, output + s->silk.flength, SILK_MAX_LPC * sizeof(float));
+
+    silk_frame++;
 
     return 0;
 }
@@ -1272,7 +1283,7 @@ static int opus_decode_frame(AVCodecContext *avctx, void *data,
             }
 
             for (j = i * s->silk.flength; j < (i + 1) * s->silk.flength; j++)
-                data[j] = av_clipf(s->silk.prevframe[0].output[j], -1.0, 1.0);
+                data[j] = s->silk.prevframe[0].output[j];
 
             s->silk.prevframe[0].coded = 1;
             s->silk.prevframe[1].coded = s->packet.stereo;

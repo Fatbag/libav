@@ -1109,20 +1109,12 @@ static inline int silk_decode_frame(OpusContext *s, int frame, int channel, int 
             }
         }
 
-        for (j = idx; j < idx + s->silk.sflength; j++)
-            av_dlog(NULL, "resptr[%d] = %f\n", j, resptr[j]);
-        //getchar();
-
         /* LPC synthesis */
         for (j = idx; j < idx + s->silk.sflength; j++) {
             outptr[j] = resptr[j] * sf[i].gain;
             for (k = 1; k <= order; k++)
                 outptr[j] += lpc[k-1] * outptr[j-k];
         }
-
-        for (j = idx; j < idx + s->silk.sflength; j++)
-            av_dlog(NULL, "outptr[%d] = %f\n", j, outptr[j]);
-        //getchar();
 
         for (j = idx; j < idx + s->silk.sflength; j++)
             prevframe->output[j] = av_clipf(outptr[j], -1.0, 1.0);

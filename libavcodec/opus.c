@@ -38,18 +38,21 @@
 #include "unary.h"
 #include "mathops.h"
 #include "celp_filters.h"
+#include "fft.h"
 #include "opus.h"
 #include "opusdata.h"
 
-#define MAX_FRAME_SIZE 1275
-#define MAX_FRAMES     48
-#define MAX_FRAME_DUR  5760
+#define MAX_FRAME_SIZE  1275
+#define MAX_FRAMES      48
+#define MAX_FRAME_DUR   5760
 
-#define SILK_HISTORY   306
-#define SILK_MAX_LPC   16
+#define SILK_HISTORY    306
+#define SILK_MAX_LPC    16
+
+#define CELT_MAX_BANDS  21
 
 #define ROUND_MULL(a,b,s) (((MUL64(a, b) >> (s - 1)) + 1) >> 1)
-#define ilog(i) av_log2((i)<<1)
+#define ilog(i) ((i) ? av_log2(i)+1 : 0)
 
 enum OpusMode {
     OPUS_MODE_SILK,
@@ -95,9 +98,9 @@ typedef struct {
 
 typedef struct {
     const uint8_t *position;
-    uint8_t byte;
-    unsigned int unreadbits;
+    unsigned int bytes;
     unsigned int cache;
+    uint8_t byte;
 } RawBitsContext;
 
 typedef struct {
@@ -105,6 +108,7 @@ typedef struct {
     RawBitsContext rb;
     unsigned int range;
     unsigned int value;
+    unsigned int total_read_bits;
 } OpusRangeCoder;
 
 typedef struct {
@@ -112,7 +116,7 @@ typedef struct {
     int voiced;
     int log_gain;
     int16_t nlsf[16];
-    int16_t lpc[16];
+    float lpc[16];
     float output[SILK_HISTORY];
     float lpc_history[16];
     int primarylag;
@@ -133,6 +137,10 @@ typedef struct {
 } CeltFrame;
 
 typedef struct {
+    int framebytes;
+    int framebits;
+    int duration;
+
     CeltFrame prevframe[2];
 } CeltContext;
 
@@ -356,11 +364,6 @@ static inline int opus_parse_packet(OpusContext *s, int selfdelimited)
             pkt->bandwidth++;
     }
 
-    /* update the raw bits location in the entropy decoder */
-    s->rc.rb.position = end + pkt->padding;
-    s->rc.rb.cache = 8;
-    s->rc.rb.byte  = s->rc.rb.position[0];
-
     opus_dprint_packet(s->avctx, pkt);
     return ptr - s->buf;
 }
@@ -373,9 +376,10 @@ static inline void opus_rc_normalize(OpusRangeCoder *rc)
 {
     while (rc->range <= 1<<23) {
         av_dlog(NULL, "--start-- value: %u\n          range: %u\n", rc->value, rc->range);
-        rc->value = ((rc->value << 8) | (255 - get_bits(rc->gb, 8))) & ((1U<<31)-1);
+        rc->value = ((rc->value << 8) | (255 - get_bits(rc->gb, 8))) & ((1u<<31)-1);
         rc->range <<= 8;
         av_dlog(NULL, "--end--   value: %u\n          range: %u\n", rc->value, rc->range);
+        rc->total_read_bits += 8;
     }
 }
 
@@ -383,6 +387,7 @@ static inline void opus_rc_init(OpusRangeCoder *rc)
 {
     rc->range = 128;
     rc->value = 127 - get_bits(rc->gb, 7);
+    rc->total_read_bits = 9;
     av_dlog(NULL, "[rc init] range: %u, value: %u\n", rc->range, rc->value);
     opus_rc_normalize(rc);
 }
@@ -412,12 +417,13 @@ static unsigned int opus_rc_getsymbol(OpusRangeCoder *rc, const uint16_t *cdf)
 static unsigned int opus_rc_extract(OpusRangeCoder *rc, unsigned int ptotal)
 {
     unsigned int k, scale, psymbol, plow, phigh;
+
     scale = rc->range / ptotal;
     psymbol = rc->value / scale;
     k = ptotal - FFMIN(psymbol+1, ptotal);
 
-    plow = k;
-    phigh = k+1;
+    plow  = k;
+    phigh = k + 1;
 
     rc->value -= scale * (ptotal - phigh);
     rc->range  = plow ? scale * (phigh - plow)
@@ -428,32 +434,39 @@ static unsigned int opus_rc_extract(OpusRangeCoder *rc, unsigned int ptotal)
     return k;
 }
 
+static inline void opus_raw_init(OpusRangeCoder *rc, const uint8_t *rightend,
+                                 unsigned int bytes)
+{
+    rc->rb.position = rightend;
+    rc->rb.bytes    = bytes;
+    rc->rb.cache    = 0;
+}
+
 /**
  * CELT: read raw bits at the end of the frame, backwards byte-wise
- *
- * The spec says that it is impossible to attempt to read more raw bits
- * than there are actual bits in the frame, so we do not do bounds checking.
  */
 static unsigned int opus_getrawbits(OpusRangeCoder *rc, unsigned int count)
 {
     unsigned int value = 0, bit = 0;
 
-    while (count) {
-        if (count <= rc->rb.cache) {
+    rc->total_read_bits += count;
+
+    while (count && (rc->rb.cache || rc->rb.bytes)) {
+        if (rc->rb.cache == 0) {
+            rc->rb.cache = 8;
+            rc->rb.bytes--;
+            rc->rb.byte = *(--rc->rb.position);
+        }
+
+        if (count < rc->rb.cache) {
             value |= (rc->rb.byte & ((1<<count)-1)) << bit;
-            bit += count;
             rc->rb.cache -= count;
             rc->rb.byte >>= count;
+            count = 0;
         } else {
             value |= rc->rb.byte << bit;
             bit += rc->rb.cache;
             rc->rb.cache = 0;
-        }
-
-        if (rc->rb.cache == 0) {
-            rc->rb.position--;
-            rc->rb.cache = 8;
-            rc->rb.byte = rc->rb.position[0];
         }
     }
 
@@ -463,7 +476,8 @@ static unsigned int opus_getrawbits(OpusRangeCoder *rc, unsigned int count)
 /**
  * CELT: read a uniform distribution
  */
-static unsigned int opus_rc_getsymbol_uni(OpusRangeCoder *rc, unsigned int size){
+static unsigned int opus_rc_getsymbol_uni(OpusRangeCoder *rc, unsigned int size)
+{
     unsigned int bits, k, ptotal;
 
     bits = ilog(size-1);
@@ -477,6 +491,34 @@ static unsigned int opus_rc_getsymbol_uni(OpusRangeCoder *rc, unsigned int size)
         return FFMIN(k, size);
     } else
         return opus_rc_extract(rc, size);
+}
+
+/**
+ * CELT: estimate bits of entropy that have thus far been consumed for the
+ *       current CELT frame, to integer and fractional (1/8th bit) precision
+ */
+static inline unsigned int opus_rc_tell(const OpusRangeCoder *rc)
+{
+    return rc->total_read_bits - ilog(rc->range);
+}
+
+static unsigned int opus_rc_tell_frac(const OpusRangeCoder *rc)
+{
+    unsigned int i, total_bits, rcbuffer, range;
+
+    total_bits = rc->total_read_bits << 3;
+    rcbuffer   = ilog(rc->range);
+    range      = rc->range >> (rcbuffer-16);
+
+    for (i = 0; i < 3; i++) {
+        int bit;
+        range = range * range >> 15;
+        bit = range >> 16;
+        rcbuffer = rcbuffer << 1 | bit;
+        range >>= bit;
+    }
+
+    return total_bits - rcbuffer;
 }
 
 /**
@@ -631,12 +673,13 @@ static void silk_lsp2poly(const int32_t lsp[16], int32_t pol[16], int half_order
     }
 }
 
-static void silk_lsf2lpc(const int16_t nlsf[16], int16_t lpc[16], int order)
+static void silk_lsf2lpc(const int16_t nlsf[16], float lpcf[16], int order)
 {
     int i, k;
-    int32_t lsp[16];    // Q17; 2*cos(LSF)
-    int32_t p[9], q[9]; // Q16
-    int32_t lpc32[16];  // Q17
+    int32_t lsp[16];     // Q17; 2*cos(LSF)
+    int32_t p[9], q[9];  // Q16
+    int32_t lpc32[16];   // Q17
+    int16_t lpc[16];     // Q12
 
     /* convert the LSFs to LSPs, i.e. 2*cos(LSF) */
     for (k = 0; k < order; k++) {
@@ -710,9 +753,12 @@ static void silk_lsf2lpc(const int16_t nlsf[16], int16_t lpc[16], int order)
             chirp    = (chirp_base * chirp + 32768) >> 16;
         }
     }
+
+    for (i = 0; i < order; i++)
+        lpcf[i] = (float)lpc[i] / 4096.0f;
 }
 
-static inline void silk_decode_lpc(OpusContext *s, int16_t lpc_leadin[16], int16_t lpc[16],
+static inline void silk_decode_lpc(OpusContext *s, float lpc_leadin[16], float lpc[16],
                                    int *lpc_order, int *has_lpc_leadin, int voiced, int channel)
 {
     int i;
@@ -794,14 +840,12 @@ static inline void silk_decode_lpc(OpusContext *s, int16_t lpc_leadin[16], int16
                         ((nlsf[i] - s->silk.prevframe[channel].nlsf[i]) * offset >> 2);
                 silk_lsf2lpc(nlsf_leadin, lpc_leadin, order);
             } else  /* avoid re-computation for a (roughly) 1-in-4 occurrence */
-                memcpy(lpc_leadin, s->silk.prevframe[channel].lpc, 16*sizeof(int16_t));
+                memcpy(lpc_leadin, s->silk.prevframe[channel].lpc, 16*sizeof(float));
         }
 
         silk_lsf2lpc(nlsf, lpc, order);
-        if(*has_lpc_leadin && !memcmp(lpc, lpc_leadin, order*sizeof(int16_t)))
-            *has_lpc_leadin = 0;
         memcpy(s->silk.prevframe[channel].nlsf, nlsf, 16*sizeof(int16_t));
-        memcpy(s->silk.prevframe[channel].lpc, lpc, 16*sizeof(int16_t));
+        memcpy(s->silk.prevframe[channel].lpc, lpc, 16*sizeof(float));
     } else
         silk_lsf2lpc(nlsf, lpc, order);
 }
@@ -818,8 +862,6 @@ static inline void silk_count_children(OpusRangeCoder *rc, int model, int32_t to
         child[1] = 0;
     }
 }
-
-static int silk_frame = 0;
 
 static inline void silk_decode_excitation(OpusContext *s, float excitationf[320],
                                           int qoffset_high, int active, int voiced)
@@ -916,12 +958,10 @@ static inline int silk_decode_frame(OpusContext *s, int frame, int channel, int 
     int voiced;       // combines with active to indicate inactive, active, or active+voiced
     int qoffset_high;
     int order;                             // order of the LPC coefficients
-    int16_t lpc_leadin[16], lpc_body[16];  // Q12
+    float lpc_leadin[16], lpc_body[16];
     int has_lpc_leadin;
-    float lpc[16];
     float ltpscale;
     float excitation[320];
-    float residual[SILK_HISTORY+320];
     float output[SILK_MAX_LPC+320];
 
     /* per subframe */
@@ -1069,38 +1109,31 @@ static inline int silk_decode_frame(OpusContext *s, int frame, int channel, int 
     /* generate the output signal */
     for (i = 0, idx = 0; i < s->silk.subframes; i++, idx += s->silk.sflength) {
         int j, k;
+        float residual[SILK_HISTORY+320];
+        const float * lpc = (i < 2 && has_lpc_leadin) ? lpc_leadin : lpc_body;
         float * resptr = (voiced) ? residual + SILK_HISTORY : excitation;
         float * outptr = output + SILK_MAX_LPC;
 
-        if (i == 0 || (i == 2 && has_lpc_leadin)) {
-            const int16_t * lpcin = (i == 0 && has_lpc_leadin) ? lpc_leadin : lpc_body;
+        if (voiced) {
+            int hist_end = (i>=2 && has_lpc_leadin) ? 2*s->silk.sflength : 0;
 
-            /* convert the LPC coefficients to floating point */
-            for (k = 0; k < order; k++)
-                lpc[k] = (float)lpcin[k] / 4096.0f;
-
-            /* since the LPC coefficients changed, a re-whitening filter is used */
+            /* when the LPC coefficients change, a re-whitening filter is used */
             /* to produce a residual that accounts for the change */
 
-            if (voiced) {
-                for (j = idx - sf[i].pitchlag - 2; j < idx; j++) {
-                    resptr[j] = prevframe->output[s->silk.flength+j];
-                    for (k = 1; k <= order; k++)
-                        resptr[j] -= lpc[k-1] * prevframe->output[s->silk.flength+j-k];
-                    resptr[j] = av_clipf(resptr[j], -1.0, 1.0) * ((i==0)?ltpscale:1.0f) / sf[i].gain;
-                }
+            for (j = idx - sf[i].pitchlag - 2; j < hist_end; j++) {
+                resptr[j] = prevframe->output[s->silk.flength+j];
+                for (k = 1; k <= order; k++)
+                    resptr[j] -= lpc[k-1] * prevframe->output[s->silk.flength+j-k];
+                resptr[j] = av_clipf(resptr[j], -1.0, 1.0) * ((i<2)?ltpscale:1.0f) / sf[i].gain;
             }
-        } else if (i != 2 && voiced) {
-            /* re-whitening filter */
-            for (j = idx - s->silk.sflength; j < idx; j++) {
+
+            for (j = hist_end; j < idx; j++) {
                 resptr[j] = outptr[j];
                 for (k = 1; k <= order; k++)
                     resptr[j] -= lpc[k-1] * outptr[j-k];
-                resptr[j] /= sf[i].gain;
+                resptr[j] = resptr[j] / sf[i].gain;
             }
-        }
 
-        if (voiced) {
             /* LTP synthesis */
             for (j = idx; j < idx + s->silk.sflength; j++) {
                 resptr[j] = excitation[j];
@@ -1115,14 +1148,11 @@ static inline int silk_decode_frame(OpusContext *s, int frame, int channel, int 
             for (k = 1; k <= order; k++)
                 outptr[j] += lpc[k-1] * outptr[j-k];
         }
-
-        for (j = idx; j < idx + s->silk.sflength; j++)
-            prevframe->output[j] = av_clipf(outptr[j], -1.0, 1.0);
     }
 
     memcpy(prevframe->lpc_history, output + s->silk.flength, SILK_MAX_LPC * sizeof(float));
-
-    silk_frame++;
+    for (i = 0; i < s->silk.flength; i++)
+        prevframe->output[i] = av_clipf(output[i + SILK_MAX_LPC], -1.0, 1.0);
 
     return 0;
 }
@@ -1131,16 +1161,157 @@ static inline int silk_decode_frame(OpusContext *s, int frame, int channel, int 
  * CELT decoder
  */
 
-static int celt_decode_frame(OpusContext *s, int hybrid)
+static void celt_laplace_decode()
 {
-    int silence;
-    int has_postfilter;
+}
+
+#if 0
+int ec_laplace_decode(ec_dec *dec, unsigned fs, int decay)
+{
+   int val=0;
+   unsigned fl;
+   unsigned fm;
+   fm = ec_decode_bin(dec, 15);
+   fl = 0;
+   if (fm >= fs)
+   {
+      val++;
+      fl = fs;
+      fs = ec_laplace_get_freq1(fs, decay)+LAPLACE_MINP;
+      /* Search the decaying part of the PDF.*/
+      while(fs > LAPLACE_MINP && fm >= fl+2*fs)
+      {
+         fs *= 2;
+         fl += fs;
+         fs = ((fs-2*LAPLACE_MINP)*(opus_int32)decay)>>15;
+         fs += LAPLACE_MINP;
+         val++;
+      }
+      /* Everything beyond that has probability LAPLACE_MINP. */
+      if (fs <= LAPLACE_MINP)
+      {
+         int di;
+         di = (fm-fl)>>(LAPLACE_LOG_MINP+1);
+         val += di;
+         fl += 2*di*LAPLACE_MINP;
+      }
+      if (fm < fl+fs)
+         val = -val;
+      else
+         fl += fs;
+   }
+   celt_assert(fl<32768);
+   celt_assert(fs>0);
+   celt_assert(fl<=fm);
+   celt_assert(fm<IMIN(fl+fs,32768));
+   ec_dec_update(dec, fl, IMIN(fl+fs,32768), 32768);
+   return val;
+}
+#endif
+
+static void celt_decode_coarse_energy(OpusContext *s, int startband, int endband)
+{
+    int i;
+    int intra = 0;
+    float prev[2] = {0};
+    float coef;
+    float beta;
+    int budget;
+    int consumed;
+    
+    /* use the 2D z-transform to apply prediction in */
+    /* both the time domain and the frequency domain */
+
+    if (opus_rc_tell(&s->rc)+3 <= s->celt.framebits &&
+        opus_rc_getsymbol(&s->rc, celt_model_transient_intra)) {
+        /* intra frame */
+        coef = 0;
+        beta = 4915.0f/32768.0f;
+    } else {
+        coef = celt_pred_coef[s->celt.duration];
+        beta = celt_beta_coef[s->celt.duration];
+    }
+    
+    budget = s->rc.total_read_bits*8;
+    
+    for (i = startband; i < endband; i++) {
+        
+    }
+}
+
+#if 0
+void unquant_coarse_energy(const CELTMode *m, int start, int end, opus_val16 *oldEBands, int intra, ec_dec *dec, int C, int LM)
+{
+   const unsigned char *prob_model = e_prob_model[LM][intra];
+   int i, c;
+   opus_val32 prev[2] = {0, 0};
+   opus_val16 coef;
+   opus_val16 beta;
+   opus_int32 budget;
+   opus_int32 tell;
+
+   if (intra) {
+      coef = 0;
+      beta = beta_intra;
+   } else {
+      beta = beta_coef[LM];
+      coef = pred_coef[LM];
+   }
+
+   budget = dec->storage*8;
+
+   /* Decode at a fixed coarse resolution */
+   for (i = start; i < end; i++)
+   {
+      c=0;
+      do {
+         int qi;
+         opus_val32 q;
+         opus_val32 tmp;
+         tell = ec_tell(dec);
+         if(budget-tell>=15)
+         {
+            int pi;
+            pi = 2*IMIN(i,20);
+            qi = ec_laplace_decode(dec,
+                  prob_model[pi]<<7, prob_model[pi+1]<<6);
+         }
+         else if(budget-tell>=2)
+         {
+            qi = ec_dec_icdf(dec, small_energy_icdf, 2);
+            qi = (qi>>1)^-(qi&1);
+         }
+         else if(budget-tell>=1)
+         {
+            qi = -ec_dec_bit_logp(dec, 1);
+         }
+         else
+            qi = -1;
+         q = (opus_val32)SHL32(EXTEND32(qi),DB_SHIFT);
+
+         oldEBands[i+c*m->nbEBands] = MAX16(-QCONST16(9.f,DB_SHIFT), oldEBands[i+c*m->nbEBands]);
+         tmp = PSHR32(MULT16_16(coef,oldEBands[i+c*m->nbEBands]),8) + prev[c] + SHL32(q,7);
+         oldEBands[i+c*m->nbEBands] = PSHR32(tmp, 7);
+         prev[c] = prev[c] + SHL32(q,7) - MULT16_16(beta,PSHR32(q,8));
+      } while (++c < C);
+   }
+}
+#endif
+
+static int celt_decode_frame(OpusContext *s, int hybrid, int startband, int endband)
+{
+    int i;
+
+    /* per frame */
+    int consumed;           // bits of entropy consumed thus far for this frame
+    int silence = 0;
+    int has_postfilter = 0;
     int pf_octave;
     int pf_period;
     int pf_gain;
     int pf_tapset;
-    int transient;
-    int intra;
+    int transient = 0;
+    int intra = 0;
     int coarseenergy;
     int tfchange;
     int tfselect;
@@ -1155,18 +1326,35 @@ static int celt_decode_frame(OpusContext *s, int hybrid)
     int anticollapse;
     int finalize;
 
-    silence = opus_rc_getsymbol(&s->rc, celt_model_silence);
-    has_postfilter = opus_rc_getsymbol(&s->rc, rc_model_bit);
+    consumed = opus_rc_tell(&s->rc);
 
-    if (has_postfilter) {
-        pf_octave = opus_rc_getsymbol_uni(&s->rc, 6);
-        pf_period = opus_getrawbits(&s->rc, 4+pf_octave);
-        pf_gain = opus_getrawbits(&s->rc, 3);
-        pf_tapset = opus_rc_getsymbol(&s->rc, celt_model_tapset);
+    if (consumed >= s->celt.framebits)
+        silence = 1;
+    else if (consumed == 1)
+        silence = opus_rc_getsymbol(&s->rc, celt_model_silence);
+
+    if (silence) {
+        /* ignore this frame */
+        consumed = s->celt.framebits;
+        s->rc.total_read_bits += s->celt.framebits - opus_rc_tell(&s->rc);
     }
 
-    transient = opus_rc_getsymbol(&s->rc, celt_model_transient_intra);
-    intra = opus_rc_getsymbol(&s->rc, celt_model_transient_intra);
+    if (startband == 0 && consumed+16 <= s->celt.framebits) {
+        has_postfilter = opus_rc_getsymbol(&s->rc, rc_model_bit);
+        if (has_postfilter) {
+            pf_octave = opus_rc_getsymbol_uni(&s->rc, 6);
+            pf_period = (16<<pf_octave) + opus_getrawbits(&s->rc, 4+pf_octave) - 1;
+            pf_gain = 0.09375f * (opus_getrawbits(&s->rc, 3) + 1);
+            if (opus_rc_tell(&s->rc)+2 <= s->celt.framebits)
+                pf_tapset = opus_rc_getsymbol(&s->rc, celt_model_tapset);
+        }
+        consumed = opus_rc_tell(&s->rc);
+    }
+
+    if (s->celt.duration != 0 && consumed+3 <= s->celt.framebits)
+        transient = opus_rc_getsymbol(&s->rc, celt_model_transient_intra);
+
+    celt_decode_coarse_energy(s, startband, endband);
 
     /* ... */
 
@@ -1192,7 +1380,6 @@ static av_cold int opus_decode_init(AVCodecContext *avctx)
     s->rc.gb = &s->gb;
 
     avctx->sample_fmt = AV_SAMPLE_FMT_FLT;
-    avctx->channels = 1;
 
     avcodec_get_frame_defaults(&s->frame);
     avctx->coded_frame = &s->frame;
@@ -1282,16 +1469,29 @@ static int opus_decode_frame(AVCodecContext *avctx, void *data,
         }
     } else {
         s->silk.prevframe[0].coded = 0;
-        s->silk.prevframe[0].coded = 0;
+        s->silk.prevframe[1].coded = 0;
     }
 
     if (s->packet.mode == OPUS_MODE_CELT || s->packet.mode == OPUS_MODE_HYBRID) {
-        /* Decode a CELT frame */
-        celt_decode_frame(s, s->packet.mode == OPUS_MODE_HYBRID);
+        /* Decode CELT frames corresponding to 21 frequency bands */
+        const uint8_t band_end[] = {13, 0, 17, 19, 21};
+
+        opus_raw_init(&s->rc, s->buf + s->buf_size - 1, s->buf_size);
+        s->celt.framebytes = s->buf_size;
+        s->celt.framebits  = s->buf_size << 3;
+        s->celt.duration = (s->packet.frame_duration >= 120)
+                           + (s->packet.frame_duration >= 240)
+                           + (s->packet.frame_duration >= 480)
+                           + (s->packet.frame_duration == 960);
+
+        celt_decode_frame(s, s->packet.mode == OPUS_MODE_HYBRID,
+                          (s->packet.mode == OPUS_MODE_HYBRID) ? 17 : 0,
+                          band_end[s->packet.bandwidth]);
 
         s->celt.prevframe[0].coded = 1;
     } else {
         s->celt.prevframe[0].coded = 0;
+        s->celt.prevframe[1].coded = 0;
     }
 
     *got_frame_ptr   = 1;
@@ -1311,6 +1511,9 @@ static int opus_decode_frame(AVCodecContext *avctx, void *data,
 static av_cold void opus_decode_flush(AVCodecContext *ctx)
 {
     OpusContext *s = ctx->priv_data;
+
+    memset(&s->silk, 0, sizeof(s->silk));
+    memset(&s->celt, 0, sizeof(s->celt));
 }
 
 AVCodec ff_opus_decoder = {

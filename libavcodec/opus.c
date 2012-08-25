@@ -134,6 +134,7 @@ typedef struct {
 
 typedef struct {
     int coded;
+    float BandEnergy[CELT_MAX_BANDS];
 } CeltFrame;
 
 typedef struct {
@@ -392,6 +393,15 @@ static inline void opus_rc_init(OpusRangeCoder *rc)
     opus_rc_normalize(rc);
 }
 
+static inline void opus_rc_seek(OpusRangeCoder *rc, unsigned int scale,
+                                unsigned int plow, unsigned int phigh, unsigned int ptotal)
+{
+    rc->value -= scale * (ptotal - phigh);
+    rc->range  = plow ? scale * (phigh - plow)
+                      : rc->range - scale * (ptotal - phigh);
+    opus_rc_normalize(rc);
+}
+
 static unsigned int opus_rc_getsymbol(OpusRangeCoder *rc, const uint16_t *cdf)
 {
     unsigned int k, scale, ptotal, psymbol, plow, phigh;
@@ -405,31 +415,23 @@ static unsigned int opus_rc_getsymbol(OpusRangeCoder *rc, const uint16_t *cdf)
     for (k = 0; (phigh = cdf[k]) <= psymbol; k++);
     plow = k ? cdf[k-1] : 0;
 
-    rc->value -= scale * (ptotal - phigh);
-    rc->range  = plow ? scale * (phigh - plow)
-                      : rc->range - scale * (ptotal - phigh);
-
-    opus_rc_normalize(rc);
+    opus_rc_seek(rc, scale, plow, phigh, ptotal);
 
     return k;
 }
 
-static unsigned int opus_rc_extract(OpusRangeCoder *rc, unsigned int ptotal)
+static unsigned int opus_rc_read(OpusRangeCoder *rc, unsigned int ptotal)
 {
     unsigned int k, scale, psymbol, plow, phigh;
 
     scale = rc->range / ptotal;
-    psymbol = rc->value / scale;
-    k = ptotal - FFMIN(psymbol+1, ptotal);
+    psymbol = rc->value / scale + 1;
+    k = ptotal - FFMIN(psymbol, ptotal);
 
     plow  = k;
     phigh = k + 1;
 
-    rc->value -= scale * (ptotal - phigh);
-    rc->range  = plow ? scale * (phigh - plow)
-                      : rc->range - scale * (ptotal - phigh);
-
-    opus_rc_normalize(rc);
+    opus_rc_seek(rc, scale, plow, phigh, ptotal);
 
     return k;
 }
@@ -486,11 +488,11 @@ static unsigned int opus_rc_getsymbol_uni(OpusRangeCoder *rc, unsigned int size)
         size--;
         bits -= 8;
         ptotal = (size>>bits) + 1;
-        k = opus_rc_extract(rc, ptotal);
+        k = opus_rc_read(rc, ptotal);
         k = k << bits | opus_getrawbits(rc, bits);
         return FFMIN(k, size);
     } else
-        return opus_rc_extract(rc, size);
+        return opus_rc_read(rc, size);
 }
 
 /**
@@ -1120,7 +1122,7 @@ static inline int silk_decode_frame(OpusContext *s, int frame, int channel, int 
             /* when the LPC coefficients change, a re-whitening filter is used */
             /* to produce a residual that accounts for the change */
 
-            for (j = idx - sf[i].pitchlag - 2; j < hist_end; j++) {
+            for (j = idx - sf[i].pitchlag - order - 2; j < hist_end; j++) {
                 resptr[j] = prevframe->output[s->silk.flength+j];
                 for (k = 1; k <= order; k++)
                     resptr[j] -= lpc[k-1] * prevframe->output[s->silk.flength+j-k];
@@ -1161,82 +1163,95 @@ static inline int silk_decode_frame(OpusContext *s, int frame, int channel, int 
  * CELT decoder
  */
 
-static void celt_laplace_decode()
+static int celt_laplace_decode(OpusRangeCoder *rc, unsigned int psymbol, int decay)
 {
-}
+    /* extends the range coder to model a Laplace distribution */
+    int value = 0;
+    unsigned int scale, plow = 0, pcenter;
 
-#if 0
-int ec_laplace_decode(ec_dec *dec, unsigned fs, int decay)
-{
-   int val=0;
-   unsigned fl;
-   unsigned fm;
-   fm = ec_decode_bin(dec, 15);
-   fl = 0;
-   if (fm >= fs)
-   {
-      val++;
-      fl = fs;
-      fs = ec_laplace_get_freq1(fs, decay)+LAPLACE_MINP;
-      /* Search the decaying part of the PDF.*/
-      while(fs > LAPLACE_MINP && fm >= fl+2*fs)
-      {
-         fs *= 2;
-         fl += fs;
-         fs = ((fs-2*LAPLACE_MINP)*(opus_int32)decay)>>15;
-         fs += LAPLACE_MINP;
-         val++;
-      }
-      /* Everything beyond that has probability LAPLACE_MINP. */
-      if (fs <= LAPLACE_MINP)
-      {
-         int di;
-         di = (fm-fl)>>(LAPLACE_LOG_MINP+1);
-         val += di;
-         fl += 2*di*LAPLACE_MINP;
-      }
-      if (fm < fl+fs)
-         val = -val;
-      else
-         fl += fs;
-   }
-   celt_assert(fl<32768);
-   celt_assert(fs>0);
-   celt_assert(fl<=fm);
-   celt_assert(fm<IMIN(fl+fs,32768));
-   ec_dec_update(dec, fl, IMIN(fl+fs,32768), 32768);
-   return val;
+    scale = rc->range >> 15;
+    pcenter = rc->value / scale + 1;
+    pcenter = (1<<15) - FFMIN(pcenter, 1<<15);
+
+    if (pcenter >= psymbol) {
+        value++;
+        plow = psymbol;
+        psymbol = 1 + ((32768 - 32 - psymbol) * (16384-decay) >> 15);
+
+        while(psymbol > 1 && pcenter >= plow + 2*psymbol) {
+            value++;
+            psymbol *= 2;
+            plow += psymbol;
+            psymbol = (((psymbol-2) * decay) >> 15) + 1;
+        }
+
+        if (psymbol <= 1) {
+            int distance = (pcenter - plow) >> 1;
+            value += distance;
+            plow += 2*distance;
+        }
+
+        if (pcenter < plow + psymbol)
+            value = -value;
+        else
+            plow += psymbol;
+    }
+
+    opus_rc_seek(rc, scale, plow, FFMIN(plow+psymbol, 32768), 32768);
+
+    return value;
 }
-#endif
 
 static void celt_decode_coarse_energy(OpusContext *s, int startband, int endband)
 {
-    int i;
-    int intra = 0;
+    int i, j;
     float prev[2] = {0};
-    float coef;
-    float beta;
-    int budget;
-    int consumed;
-    
+    float alpha, beta;
+    const uint8_t *model;
+
     /* use the 2D z-transform to apply prediction in */
     /* both the time domain and the frequency domain */
 
     if (opus_rc_tell(&s->rc)+3 <= s->celt.framebits &&
-        opus_rc_getsymbol(&s->rc, celt_model_transient_intra)) {
+        opus_rc_getsymbol(&s->rc, rc_model_1_8)) {
         /* intra frame */
-        coef = 0;
-        beta = 4915.0f/32768.0f;
+        alpha = 0;
+        beta  = 1.0f - 4915.0f/32768.0f;
+        model = celt_coarse_energy_dist[s->celt.duration][1];
+        av_dlog(NULL, "intra: %d\n", 1);
     } else {
-        coef = celt_pred_coef[s->celt.duration];
-        beta = celt_beta_coef[s->celt.duration];
+        alpha = celt_alpha_coef[s->celt.duration];
+        beta  = 1.0f - celt_beta_coef[s->celt.duration];
+        model = celt_coarse_energy_dist[s->celt.duration][0];
+        av_dlog(NULL, "intra: %d\n", 0);
     }
-    
-    budget = s->rc.total_read_bits*8;
-    
+
+    av_dlog(NULL, "alpha: %f, beta: %f, LM: %d\n", alpha, 1.0f - beta, s->celt.duration);
+    getchar();
+
     for (i = startband; i < endband; i++) {
-        
+        for (j = 0; j <= s->packet.stereo; j++) {
+            float value;
+            int available = s->celt.framebits - opus_rc_tell(&s->rc);
+
+            if (available >= 15) {
+                /* decode qi using a Laplace distribution */
+                int k = FFMIN(i, 20) << 1;
+                value = celt_laplace_decode(&s->rc, model[k] << 7, model[k+1] << 6);
+            } else if (available >= 2) {
+                int x = opus_rc_getsymbol(&s->rc, celt_model_energy_small);
+                value = (x>>1) ^ -(x&1);
+            } else if (available >= 1) {
+                value = -opus_rc_getsymbol(&s->rc, rc_model_bit);
+            } else value = -1;
+
+            s->celt.prevframe[j].BandEnergy[i] =
+                FFMAX(-9.0f, s->celt.prevframe[j].BandEnergy[i]) * alpha + prev[j] + value;
+            prev[j] += beta * value;
+            av_dlog(NULL, "s->celt.prevframe[%d].BandEnergy[%d] = %f\n", j, i, s->celt.prevframe[j].BandEnergy[i]);
+        }
     }
+    getchar();
 }
 
 #if 0
@@ -1263,8 +1278,7 @@ void unquant_coarse_energy(const CELTMode *m, int start, int end, opus_val16 *ol
    /* Decode at a fixed coarse resolution */
    for (i = start; i < end; i++)
    {
-      c=0;
-      do {
+      for (c = 0; c < C; c++) {
          int qi;
          opus_val32 q;
          opus_val32 tmp;
@@ -1274,12 +1288,12 @@ void unquant_coarse_energy(const CELTMode *m, int start, int end, opus_val16 *ol
             int pi;
             pi = 2*IMIN(i,20);
             qi = ec_laplace_decode(dec,
-                  prob_model[pi]<<7, prob_model[pi+1]<<6);
+                prob_model[pi]<<7, prob_model[pi+1]<<6);
          }
          else if(budget-tell>=2)
          {
-            qi = ec_dec_icdf(dec, small_energy_icdf, 2);
-            qi = (qi>>1)^-(qi&1);
+            qi = ec_dec_icdf(dec, celt_model_energy_small);
+            qi = (q>>1) ^ -(q&1);
          }
          else if(budget-tell>=1)
          {
@@ -1293,7 +1307,7 @@ void unquant_coarse_energy(const CELTMode *m, int start, int end, opus_val16 *ol
          tmp = PSHR32(MULT16_16(coef,oldEBands[i+c*m->nbEBands]),8) + prev[c] + SHL32(q,7);
          oldEBands[i+c*m->nbEBands] = PSHR32(tmp, 7);
          prev[c] = prev[c] + SHL32(q,7) - MULT16_16(beta,PSHR32(q,8));
-      } while (++c < C);
+      }
    }
 }
 #endif
@@ -1327,11 +1341,13 @@ static int celt_decode_frame(OpusContext *s, int hybrid, int startband, int endb
     int finalize;
 
     consumed = opus_rc_tell(&s->rc);
+    av_dlog(NULL, "startband = %d, endband = %d\n", startband, endband);
+    av_dlog(NULL, "initial consumption: %d, total bits: %d\n", consumed, s->celt.framebits);
 
     if (consumed >= s->celt.framebits)
         silence = 1;
     else if (consumed == 1)
-        silence = opus_rc_getsymbol(&s->rc, celt_model_silence);
+        silence = opus_rc_getsymbol(&s->rc, rc_model_1_32768);
 
     if (silence) {
         /* ignore this frame */
@@ -1339,20 +1355,25 @@ static int celt_decode_frame(OpusContext *s, int hybrid, int startband, int endb
         s->rc.total_read_bits += s->celt.framebits - opus_rc_tell(&s->rc);
     }
 
+    av_dlog(NULL, "silence: %d\n", silence);
+
     if (startband == 0 && consumed+16 <= s->celt.framebits) {
         has_postfilter = opus_rc_getsymbol(&s->rc, rc_model_bit);
+        av_dlog(NULL, "has postfilter: %d\n", has_postfilter);
         if (has_postfilter) {
             pf_octave = opus_rc_getsymbol_uni(&s->rc, 6);
             pf_period = (16<<pf_octave) + opus_getrawbits(&s->rc, 4+pf_octave) - 1;
             pf_gain = 0.09375f * (opus_getrawbits(&s->rc, 3) + 1);
-            if (opus_rc_tell(&s->rc)+2 <= s->celt.framebits)
-                pf_tapset = opus_rc_getsymbol(&s->rc, celt_model_tapset);
+            pf_tapset = (opus_rc_tell(&s->rc)+2 <= s->celt.framebits)
+                        ? opus_rc_getsymbol(&s->rc, celt_model_tapset) : 0;
         }
         consumed = opus_rc_tell(&s->rc);
     }
 
     if (s->celt.duration != 0 && consumed+3 <= s->celt.framebits)
-        transient = opus_rc_getsymbol(&s->rc, celt_model_transient_intra);
+        transient = opus_rc_getsymbol(&s->rc, rc_model_1_8);
+
+    av_dlog(NULL, "transient: %d\n", transient);
 
     celt_decode_coarse_energy(s, startband, endband);
 
@@ -1473,14 +1494,13 @@ static int opus_decode_frame(AVCodecContext *avctx, void *data,
     }
 
     if (s->packet.mode == OPUS_MODE_CELT || s->packet.mode == OPUS_MODE_HYBRID) {
-        /* Decode CELT frames corresponding to 21 frequency bands */
+        /* Decode a CELT frame */
         const uint8_t band_end[] = {13, 0, 17, 19, 21};
 
         opus_raw_init(&s->rc, s->buf + s->buf_size - 1, s->buf_size);
         s->celt.framebytes = s->buf_size;
         s->celt.framebits  = s->buf_size << 3;
-        s->celt.duration = (s->packet.frame_duration >= 120)
-                           + (s->packet.frame_duration >= 240)
+        s->celt.duration = (s->packet.frame_duration >= 240)
                            + (s->packet.frame_duration >= 480)
                            + (s->packet.frame_duration == 960);
 

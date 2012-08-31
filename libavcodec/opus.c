@@ -80,6 +80,13 @@ static const char *const opus_bandwidth_str[5] = {
 };
 #endif
 
+enum CeltSpread {
+    CELT_SPREAD_NONE,
+    CELT_SPREAD_LIGHT,
+    CELT_SPREAD_NORMAL,
+    CELT_SPREAD_AGGRESSIVE
+};
+
 typedef struct {
     int size;                       /** packet size */
     int code;                       /** packet code: specifies the frame layout */
@@ -134,7 +141,7 @@ typedef struct {
 
 typedef struct {
     int coded;
-    float BandEnergy[CELT_MAX_BANDS];
+    float band_energy[CELT_MAX_BANDS];
 } CeltFrame;
 
 typedef struct {
@@ -416,6 +423,20 @@ static unsigned int opus_rc_getsymbol(OpusRangeCoder *rc, const uint16_t *cdf)
     plow = k ? cdf[k-1] : 0;
 
     opus_rc_seek(rc, scale, plow, phigh, ptotal);
+
+    return k;
+}
+
+static unsigned int opus_rc_p2model(OpusRangeCoder *rc, unsigned int bits)
+{
+    unsigned int k, scale;
+    scale = rc->range >> bits; // in this case, scale = psymbol
+    k = rc->value < scale;     // in this case, k = plow
+
+    if(k == 0)
+        rc->value -= scale;
+    rc->range = k ? scale : rc->range - scale;
+    opus_rc_normalize(rc);
 
     return k;
 }
@@ -1163,7 +1184,7 @@ static inline int silk_decode_frame(OpusContext *s, int frame, int channel, int 
  * CELT decoder
  */
 
-static int celt_laplace_decode(OpusRangeCoder *rc, unsigned int psymbol, int decay)
+static inline int celt_laplace_decode(OpusRangeCoder *rc, unsigned int psymbol, int decay)
 {
     /* extends the range coder to model a Laplace distribution */
     int value = 0;
@@ -1202,7 +1223,7 @@ static int celt_laplace_decode(OpusRangeCoder *rc, unsigned int psymbol, int dec
     return value;
 }
 
-static void celt_decode_coarse_energy(OpusContext *s, int startband, int endband)
+static inline void celt_decode_coarse_energy(OpusContext *s, int startband, int endband)
 {
     int i, j;
     float prev[2] = {0};
@@ -1213,7 +1234,7 @@ static void celt_decode_coarse_energy(OpusContext *s, int startband, int endband
     /* both the time domain and the frequency domain */
 
     if (opus_rc_tell(&s->rc)+3 <= s->celt.framebits &&
-        opus_rc_getsymbol(&s->rc, rc_model_1_8)) {
+        opus_rc_p2model(&s->rc, 3)) {
         /* intra frame */
         alpha = 0;
         beta  = 1.0f - 4915.0f/32768.0f;
@@ -1235,89 +1256,62 @@ static void celt_decode_coarse_energy(OpusContext *s, int startband, int endband
             int available = s->celt.framebits - opus_rc_tell(&s->rc);
 
             if (available >= 15) {
-                /* decode qi using a Laplace distribution */
+                /* decode using a Laplace distribution */
                 int k = FFMIN(i, 20) << 1;
                 value = celt_laplace_decode(&s->rc, model[k] << 7, model[k+1] << 6);
             } else if (available >= 2) {
                 int x = opus_rc_getsymbol(&s->rc, celt_model_energy_small);
                 value = (x>>1) ^ -(x&1);
             } else if (available >= 1) {
-                value = -opus_rc_getsymbol(&s->rc, rc_model_bit);
+                value = -opus_rc_p2model(&s->rc, 1);
             } else value = -1;
 
-            s->celt.prevframe[j].BandEnergy[i] =
-                FFMAX(-9.0f, s->celt.prevframe[j].BandEnergy[i]) * alpha + prev[j] + value;
+            s->celt.prevframe[j].band_energy[i] =
+                FFMAX(-9.0f, s->celt.prevframe[j].band_energy[i]) * alpha + prev[j] + value;
             prev[j] += beta * value;
-            av_dlog(NULL, "s->celt.prevframe[%d].BandEnergy[%d] = %f\n", j, i, s->celt.prevframe[j].BandEnergy[i]);
+            av_dlog(NULL, "s->celt.prevframe[%d].band_energy[%d] = %f\n", j, i, s->celt.prevframe[j].band_energy[i]);
         }
     }
     getchar();
 }
 
-#if 0
-void unquant_coarse_energy(const CELTMode *m, int start, int end, opus_val16 *oldEBands, int intra, ec_dec *dec, int C, int LM)
+static inline void celt_decode_tf_changes(OpusContext *s, int transient,
+                                          int tf_change[CELT_MAX_BANDS],
+                                          int startband, int endband)
 {
-   const unsigned char *prob_model = e_prob_model[LM][intra];
-   int i, c;
-   opus_val32 prev[2] = {0, 0};
-   opus_val16 coef;
-   opus_val16 beta;
-   opus_int32 budget;
-   opus_int32 tell;
+    int i, diff = 0, tf_select = 0, tf_changed = 0, tf_select_bit;
+    int consumed, bits = transient ? 2 : 4;
 
-   if (intra) {
-      coef = 0;
-      beta = beta_intra;
-   } else {
-      beta = beta_coef[LM];
-      coef = pred_coef[LM];
-   }
+    consumed = opus_rc_tell(&s->rc);
+    tf_select_bit = (s->celt.duration > 0 && consumed+bits+1 <= s->celt.framebits);
 
-   budget = dec->storage*8;
+    for (i = startband; i < endband; i++) {
+        if (consumed+bits+tf_select_bit <= s->celt.framebits) {
+            diff ^= opus_rc_p2model(&s->rc, bits);
+            consumed = opus_rc_tell(&s->rc);
+            tf_changed |= diff;
+        }
+        tf_change[i] = diff;
+        bits = transient ? 4 : 5;
+    }
 
-   /* Decode at a fixed coarse resolution */
-   for (i = start; i < end; i++)
-   {
-      for (c = 0; c < C; c++) {
-         int qi;
-         opus_val32 q;
-         opus_val32 tmp;
-         tell = ec_tell(dec);
-         if(budget-tell>=15)
-         {
-            int pi;
-            pi = 2*IMIN(i,20);
-            qi = ec_laplace_decode(dec,
-                prob_model[pi]<<7, prob_model[pi+1]<<6);
-         }
-         else if(budget-tell>=2)
-         {
-            qi = ec_dec_icdf(dec, celt_model_energy_small);
-            qi = (q>>1) ^ -(q&1);
-         }
-         else if(budget-tell>=1)
-         {
-            qi = -ec_dec_bit_logp(dec, 1);
-         }
-         else
-            qi = -1;
-         q = (opus_val32)SHL32(EXTEND32(qi),DB_SHIFT);
+    if (tf_select_bit && celt_tf_select[s->celt.duration][transient][0][tf_changed] !=
+                         celt_tf_select[s->celt.duration][transient][1][tf_changed])
+        tf_select = opus_rc_p2model(&s->rc, 1);
 
-         oldEBands[i+c*m->nbEBands] = MAX16(-QCONST16(9.f,DB_SHIFT), oldEBands[i+c*m->nbEBands]);
-         tmp = PSHR32(MULT16_16(coef,oldEBands[i+c*m->nbEBands]),8) + prev[c] + SHL32(q,7);
-         oldEBands[i+c*m->nbEBands] = PSHR32(tmp, 7);
-         prev[c] = prev[c] + SHL32(q,7) - MULT16_16(beta,PSHR32(q,8));
-      }
-   }
+    for (i = startband; i < endband; i++) {
+        tf_change[i] = celt_tf_select[s->celt.duration][transient][tf_select][tf_change[i]];
+        av_dlog(NULL, "tf_change[%d] = %d\n", i, tf_change[i]);
+    }
+    getchar();
 }
-#endif
 
 static int celt_decode_frame(OpusContext *s, int hybrid, int startband, int endband)
 {
     int i;
 
     /* per frame */
-    int consumed;           // bits of entropy consumed thus far for this frame
+    int consumed;            // bits of entropy consumed thus far for this frame
     int silence = 0;
     int has_postfilter = 0;
     int pf_octave;
@@ -1325,65 +1319,119 @@ static int celt_decode_frame(OpusContext *s, int hybrid, int startband, int endb
     int pf_gain;
     int pf_tapset;
     int transient = 0;
-    int intra = 0;
-    int coarseenergy;
-    int tfchange;
-    int tfselect;
-    int spread;
-    int dynalloc;
-    int alloctrim;
-    int skip;
-    int intensity;
-    int dual;
+    int tf_change[CELT_MAX_BANDS];
+    int spread = CELT_SPREAD_NORMAL;
+    int cap[CELT_MAX_BANDS]; // approx. maximum bit allocation for each band before boost/trim
+    int dynalloc = 6;
+    int totalbits;
+    int boost[CELT_MAX_BANDS];
+    int alloctrim = 5;
+    int anticollapse_bit = 0;
+    int skip_bit = 0;
+    int skip = 0;
+    int intensity = 0;
+    int dual = 0;
     int fineenergy;
     int residual;
-    int anticollapse;
+    int anticollapse = 0;
     int finalize;
 
     consumed = opus_rc_tell(&s->rc);
     av_dlog(NULL, "startband = %d, endband = %d\n", startband, endband);
     av_dlog(NULL, "initial consumption: %d, total bits: %d\n", consumed, s->celt.framebits);
 
+    /* silence flag */
     if (consumed >= s->celt.framebits)
         silence = 1;
     else if (consumed == 1)
-        silence = opus_rc_getsymbol(&s->rc, rc_model_1_32768);
+        silence = opus_rc_p2model(&s->rc, 15);
 
     if (silence) {
-        /* ignore this frame */
+        /* ignore the rest of the bits in this frame */
         consumed = s->celt.framebits;
         s->rc.total_read_bits += s->celt.framebits - opus_rc_tell(&s->rc);
     }
 
     av_dlog(NULL, "silence: %d\n", silence);
 
+    /* post-filter options */
     if (startband == 0 && consumed+16 <= s->celt.framebits) {
-        has_postfilter = opus_rc_getsymbol(&s->rc, rc_model_bit);
+        has_postfilter = opus_rc_p2model(&s->rc, 1);
         av_dlog(NULL, "has postfilter: %d\n", has_postfilter);
         if (has_postfilter) {
             pf_octave = opus_rc_getsymbol_uni(&s->rc, 6);
             pf_period = (16<<pf_octave) + opus_getrawbits(&s->rc, 4+pf_octave) - 1;
-            pf_gain = 0.09375f * (opus_getrawbits(&s->rc, 3) + 1);
+            pf_gain   = 0.09375f * (opus_getrawbits(&s->rc, 3) + 1);
             pf_tapset = (opus_rc_tell(&s->rc)+2 <= s->celt.framebits)
                         ? opus_rc_getsymbol(&s->rc, celt_model_tapset) : 0;
         }
         consumed = opus_rc_tell(&s->rc);
     }
 
+    /* transient flag */
     if (s->celt.duration != 0 && consumed+3 <= s->celt.framebits)
-        transient = opus_rc_getsymbol(&s->rc, rc_model_1_8);
+        transient = opus_rc_p2model(&s->rc, 3);
 
     av_dlog(NULL, "transient: %d\n", transient);
 
     celt_decode_coarse_energy(s, startband, endband);
+    celt_decode_tf_changes(s, transient, tf_change, startband, endband);
+    consumed = opus_rc_tell(&s->rc);
 
-    /* ... */
+    /* spread flag */
+    if (consumed+4 <= s->celt.framebits)
+        spread = opus_rc_getsymbol(&s->rc, celt_model_spread);
+    av_dlog(NULL, "spread: %d\n", spread);
 
-    spread = opus_rc_getsymbol(&s->rc, celt_model_spread);
+    /* generate static allocation caps */
+    for (i = 0; i < CELT_MAX_BANDS; i++) {
+        cap[i] = (celt_static_caps[s->celt.duration][s->packet.stereo][i] + 64) *
+                 (s->packet.stereo+1) * (((celt_freq_bands[i+1] - celt_freq_bands[i])/200)
+                 << s->celt.duration) >> 2;
+        av_dlog(NULL, "cap[%d] = %d\n", i, cap[i]);
+    }
+    getchar();
 
-    /* ... */
+    /* band boost */
+    totalbits = s->celt.framebits << 3; // convert to 1/8 bits
+    consumed = opus_rc_tell_frac(&s->rc);
+    for (i = startband; i < endband; i++) {
+        int quanta, band_dynalloc;
+        boost[i] = 0;
+        quanta = (s->packet.stereo+1) * (celt_freq_bands[i+1] - celt_freq_bands[i])/200
+                 << s->celt.duration;
+        quanta = FFMIN(quanta<<3, FFMAX(6<<3, quanta));
+        band_dynalloc = dynalloc;
+        while (consumed + (band_dynalloc<<3) < totalbits && boost[i] < cap[i]) {
+            int add = opus_rc_p2model(&s->rc, band_dynalloc);
+            consumed = opus_rc_tell_frac(&s->rc);
+            if (!add)
+                break;
+            boost[i] += quanta;
+            totalbits -= quanta;
+            band_dynalloc = 1;
+        }
+        av_dlog(NULL, "boost[%d] = %d\n", i, boost[i]);
+        /* dynalloc is more likely to occur if it's already been used for earlier bands */
+        if (boost[i])
+            dynalloc = FFMAX(2, dynalloc-1);
+    }
+    getchar();
 
-    alloctrim = opus_rc_getsymbol(&s->rc, celt_model_alloc_trim);
+    /* allocation trim */
+    if (consumed + (6<<3) <= totalbits)
+        alloctrim = opus_rc_getsymbol(&s->rc, celt_model_alloc_trim);
+
+    av_dlog(NULL, "alloctrim: %d\n", alloctrim);
+    getchar();
+
+    /* anti-collapse bit reservation */
+    totalbits = (s->celt.framebits << 3) - opus_rc_tell_frac(&s->rc) - 1;
+    if (transient && s->celt.duration >= 2 && totalbits >= ((s->celt.duration+2) << 3))
+        anticollapse_bit = 1<<3;
+
+    /* band skip bit reservation */
+
     return 0;
 }
 
@@ -1464,9 +1512,9 @@ static int opus_decode_frame(AVCodecContext *avctx, void *data,
         /* read the LP-layer header bits */
         for (i = 0; i <= s->packet.stereo; i++) {
             for (j = 0; j < silkframes; j++)
-                active[i][j] = opus_rc_getsymbol(&s->rc, rc_model_bit);
+                active[i][j] = opus_rc_p2model(&s->rc, 1);
 
-            redundancy[i] = opus_rc_getsymbol(&s->rc, rc_model_bit);
+            redundancy[i] = opus_rc_p2model(&s->rc, 1);
             if (redundancy[i]) {
                 av_log(avctx, AV_LOG_ERROR, "LBRR frames present; this is unsupported\n");
                 return AVERROR_PATCHWELCOME;
